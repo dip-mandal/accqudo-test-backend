@@ -1,0 +1,206 @@
+# ============================================================
+# ACCQUDO - ROOT GITIGNORE
+# ============================================================
+
+# ------------------------------------------------------------
+# Environment / Secrets
+# ------------------------------------------------------------
+.env
+.env.*
+!.env.example
+!.env.template
+.env
+.env.cloudrun-test
+
+service-account.json
+
+
+
+.env
+.env.*
+!.env.example
+
+service-account.json
+**/service-account.json
+**/*firebase-adminsdk*.json
+
+*.key
+*.p12
+
+
+
+
+# Production/local test environment files
+backend/.env.cloudrun-test
+backend/.env.production
+backend/.env.local
+apps/web/.env.local
+apps/web/.env.production
+apps/web/.env.production.local
+
+alembic/*
+
+alembic/
+# ------------------------------------------------------------
+# Firebase / Service Account Credentials
+# ------------------------------------------------------------
+**/service-account.json
+**/firebase-service-account.json
+**/*firebase-adminsdk*.json
+**/firebase-adminsdk-*.json
+
+# Never commit private keys
+**/*.pem
+**/*.key
+**/*.p12
+**/*.crt
+
+# IMPORTANT:
+# The Aiven CA certificate is required inside the production image.
+# Therefore, if your CA file is named ca.pem, explicitly allow it:
+!backend/certs/
+!backend/certs/ca.pem
+
+# ------------------------------------------------------------
+# Python
+# ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+*.egg
+*.egg-info/
+.eggs/
+
+build/
+dist/
+
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.pyre/
+.ruff_cache/
+
+# ------------------------------------------------------------
+# Node / Next.js
+# ------------------------------------------------------------
+node_modules/
+
+.next/
+out/
+dist/
+build/
+
+.turbo/
+.vercel/
+
+*.tsbuildinfo
+
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ------------------------------------------------------------
+# IDE / Editors
+# ------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ------------------------------------------------------------
+# Logs
+# ------------------------------------------------------------
+*.log
+logs/
+
+# ------------------------------------------------------------
+# Temporary files
+# ------------------------------------------------------------
+tmp/
+temp/
+.cache/
+
+# ------------------------------------------------------------
+# Database / Local data
+# ------------------------------------------------------------
+*.sql
+*.sqlite
+*.sqlite3
+*.db
+*.db-shm
+*.db-wal
+
+# ------------------------------------------------------------
+# Docker
+# ------------------------------------------------------------
+docker-compose.override.yml
+docker-compose.prod.override.yml
+
+# Docker local volumes
+mysql_data/
+redis_data/
+postgres_data/
+
+# ------------------------------------------------------------
+# Testing
+# ------------------------------------------------------------
+coverage/
+.nyc_output/
+
+# ------------------------------------------------------------
+# OS files
+# ------------------------------------------------------------
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+
+# ------------------------------------------------------------
+# Generated / Exported files
+# ------------------------------------------------------------
+*.csv
+*.xlsx
+*.xls
+*.pdf
+
+# ------------------------------------------------------------
+# Local backups
+# ------------------------------------------------------------
+*_backup.sql
+*_backup_*.sql
+backup/
+backups/
+
+# ------------------------------------------------------------
+# Certificates / Keys
+# ------------------------------------------------------------
+# Keep private certificates and keys ignored.
+# The Aiven CA certificate is explicitly allowed above.
+
+# ------------------------------------------------------------
+# Misc
+# ------------------------------------------------------------
+*.bak
+*.tmp
+*.temp
+*.orig
+*.rej

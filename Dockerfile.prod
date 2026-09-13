@@ -1,0 +1,71 @@
+# ============================================================
+# Accqudo Backend - Production Dockerfile
+# Google Cloud Run
+# ============================================================
+
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# Build dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    default-libmysqlclient-dev \
+    pkg-config \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+COPY requirements.txt .
+
+RUN pip install --no-cache-dir --user -r requirements.txt
+
+
+# ============================================================
+# Runtime image
+# ============================================================
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app \
+    PATH=/root/.local/bin:$PATH
+
+# Runtime packages
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    default-mysql-client \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy installed Python packages
+COPY --from=builder /root/.local /root/.local
+
+# Copy application
+COPY . .
+
+# Aiven MySQL CA certificate
+# Expected location:
+# backend/certs/ca.pem
+#
+# Because the entire backend directory is copied to /app,
+# this becomes:
+# /app/certs/ca.pem
+
+EXPOSE 8080
+
+# Cloud Run provides $PORT.
+# One worker is preferable initially because Cloud Run
+# handles horizontal scaling with multiple instances.
+CMD exec uvicorn app.main:app \
+    --host 0.0.0.0 \
+    --port ${PORT:-8080} \
+    --workers 1 \
+    --proxy-headers \
+    --forwarded-allow-ips="*"
+    
