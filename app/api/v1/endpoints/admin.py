@@ -837,7 +837,7 @@ async def search_questions(
     chapter_id: Optional[int] = Query(None),
     topic_id: Optional[int] = Query(None),
     question_type: Optional[str] = Query(None),
-    limit: int = Query(50000, le=100000),
+    limit: int = Query(50, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
