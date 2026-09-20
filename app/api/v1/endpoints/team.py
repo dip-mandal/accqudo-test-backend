@@ -139,7 +139,7 @@ async def get_all_packages(
 
 @router.get("/questions/search")
 async def search_questions(
-    limit: int = 100,
+    limit: int = 50000,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(require_team_or_admin),
 ):
@@ -148,7 +148,7 @@ async def search_questions(
     """
 
     # Prevent unreasonable requests.
-    limit = max(1, min(limit, 500))
+    limit = max(1, min(limit, 50000))
 
     stmt = (
         select(Question)
