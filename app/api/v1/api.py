@@ -10,7 +10,10 @@ from app.api.v1.endpoints import (
     super_admin,
     team,
     sells,
+    
 )
+
+from app.api.v1.team import contribution
 
 api_router = APIRouter()
 
@@ -27,6 +30,8 @@ api_router.include_router(admin.router, prefix="/admin", tags=["Admin Studio & C
 
 
 api_router.include_router(sells.router)
+
+api_router.include_router(contribution.router)
 
 
 api_router.include_router(
