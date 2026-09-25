@@ -2,7 +2,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.v1.deps import get_db, get_current_user
 
@@ -11,7 +12,6 @@ from app.models.package import (
     SubscriptionPackage,
     UserSubscription,
     Payment,
-    RazorpayOrder,
 )
 
 
@@ -50,8 +50,8 @@ def require_admin_or_super_admin(
     current_user: User = Depends(get_current_user),
 ) -> User:
     """
-    Package sales information is restricted to
-    ADMIN and SUPER_ADMIN users.
+    Only ADMIN and SUPER_ADMIN users can access
+    package sales information.
     """
 
     role = str(
@@ -72,7 +72,7 @@ def require_admin_or_super_admin(
 
 
 # ============================================================
-# Generic helpers
+# Helpers
 # ============================================================
 
 def get_value(
@@ -81,10 +81,7 @@ def get_value(
     default: Any = None,
 ) -> Any:
     """
-    Read the first available/non-null field from an ORM object.
-
-    This allows the endpoint to work with the existing models
-    without modifying their field names.
+    Safely read the first available field from an ORM object.
     """
 
     if obj is None:
@@ -118,7 +115,10 @@ def normalize_status(value: Any) -> str:
     return str(value or "").strip().lower()
 
 
-def serialize_datetime(value: Any) -> Optional[str]:
+def serialize_datetime(
+    value: Any,
+) -> Optional[str]:
+
     if value is None:
         return None
 
@@ -128,12 +128,65 @@ def serialize_datetime(value: Any) -> Optional[str]:
     return str(value)
 
 
-def get_object_id(obj: Any) -> Any:
+def get_id(obj: Any) -> Any:
     return getattr(obj, "id", None)
 
 
-def is_successful_payment(payment: Any) -> bool:
-    status_value = normalize_status(
+def get_package_title(
+    package: Any,
+) -> str:
+
+    return str(
+        get_value(
+            package,
+            "title",
+            "name",
+            "package_name",
+            "display_name",
+            default="Package",
+        )
+    )
+
+
+def get_package_price(
+    package: Any,
+) -> float:
+
+    return to_float(
+        get_value(
+            package,
+            "price_inr",
+            "price",
+            "amount",
+            "amount_inr",
+            "selling_price",
+            default=0,
+        )
+    )
+
+
+def get_payment_amount(
+    payment: Any,
+) -> float:
+
+    return to_float(
+        get_value(
+            payment,
+            "amount_inr",
+            "amount",
+            "price",
+            "amount_paid",
+            "paid_amount",
+            default=0,
+        )
+    )
+
+
+def get_payment_status(
+    payment: Any,
+) -> str:
+
+    return normalize_status(
         get_value(
             payment,
             "status",
@@ -142,7 +195,86 @@ def is_successful_payment(payment: Any) -> bool:
         )
     )
 
-    return status_value in SUCCESSFUL_PAYMENT_STATUSES
+
+def get_payment_package_id(
+    payment: Any,
+) -> Any:
+
+    return get_value(
+        payment,
+        "package_id",
+        "packageId",
+        "subscription_package_id",
+        "subscriptionPackageId",
+        default=None,
+    )
+
+
+def get_payment_user_id(
+    payment: Any,
+) -> Any:
+
+    return get_value(
+        payment,
+        "user_id",
+        "userId",
+        "student_id",
+        "studentId",
+        default=None,
+    )
+
+
+def get_subscription_package_id(
+    subscription: Any,
+) -> Any:
+
+    return get_value(
+        subscription,
+        "package_id",
+        "packageId",
+        "subscription_package_id",
+        "subscriptionPackageId",
+        default=None,
+    )
+
+
+def get_subscription_user_id(
+    subscription: Any,
+) -> Any:
+
+    return get_value(
+        subscription,
+        "user_id",
+        "userId",
+        "student_id",
+        "studentId",
+        default=None,
+    )
+
+
+def get_created_at(
+    obj: Any,
+) -> Any:
+
+    return get_value(
+        obj,
+        "created_at",
+        "createdAt",
+        "paid_at",
+        "payment_date",
+        "purchased_at",
+        default=None,
+    )
+
+
+def is_successful_payment(
+    payment: Any,
+) -> bool:
+
+    return (
+        get_payment_status(payment)
+        in SUCCESSFUL_PAYMENT_STATUSES
+    )
 
 
 def is_active_subscription(
@@ -166,7 +298,6 @@ def is_active_subscription(
         default=None,
     )
 
-    # Explicit false always means inactive.
     if is_active is False:
         return False
 
@@ -175,10 +306,12 @@ def is_active_subscription(
     if is_active is True:
         active = True
 
-    elif status_value in ACTIVE_SUBSCRIPTION_STATUSES:
+    elif (
+        status_value
+        in ACTIVE_SUBSCRIPTION_STATUSES
+    ):
         active = True
 
-    # Check expiry/end date if the model contains one.
     expiry = get_value(
         subscription,
         "end_date",
@@ -196,122 +329,19 @@ def is_active_subscription(
     return active
 
 
-def get_package_title(package: Any) -> str:
-    return str(
-        get_value(
-            package,
-            "title",
-            "name",
-            "package_name",
-            "display_name",
-            default="Package",
-        )
-    )
-
-
-def get_package_price(package: Any) -> float:
-    return to_float(
-        get_value(
-            package,
-            "price_inr",
-            "price",
-            "amount",
-            "amount_inr",
-            "selling_price",
-            default=0,
-        )
-    )
-
-
-def get_payment_amount(payment: Any) -> float:
-    return to_float(
-        get_value(
-            payment,
-            "amount_inr",
-            "amount",
-            "price",
-            "amount_paid",
-            "paid_amount",
-            default=0,
-        )
-    )
-
-
-def get_package_id_from_payment(payment: Any) -> Any:
-    return get_value(
-        payment,
-        "package_id",
-        "packageId",
-        "subscription_package_id",
-        "subscriptionPackageId",
-        default=None,
-    )
-
-
-def get_package_id_from_subscription(
-    subscription: Any,
-) -> Any:
-    return get_value(
-        subscription,
-        "package_id",
-        "packageId",
-        "subscription_package_id",
-        "subscriptionPackageId",
-        default=None,
-    )
-
-
-def get_user_id_from_subscription(
-    subscription: Any,
-) -> Any:
-    return get_value(
-        subscription,
-        "user_id",
-        "userId",
-        "student_id",
-        "studentId",
-        default=None,
-    )
-
-
-def get_user_id_from_payment(
-    payment: Any,
-) -> Any:
-    return get_value(
-        payment,
-        "user_id",
-        "userId",
-        "student_id",
-        "studentId",
-        default=None,
-    )
-
-
-def get_created_at(obj: Any) -> Any:
-    return get_value(
-        obj,
-        "created_at",
-        "createdAt",
-        "paid_at",
-        "payment_date",
-        "purchased_at",
-        default=None,
-    )
-
-
 # ============================================================
 # Dashboard
 # ============================================================
 
 @router.get("/dashboard")
-def get_package_sales_dashboard(
+async def get_package_sales_dashboard(
     months: int = Query(
         default=12,
         ge=1,
         le=36,
         description="Number of months to include in the report.",
     ),
-    db: Session = Depends(get_db),
+    db: AsyncSession = Depends(get_db),
     current_user: User = Depends(
         require_admin_or_super_admin
     ),
@@ -319,31 +349,44 @@ def get_package_sales_dashboard(
 
     now = datetime.utcnow()
 
-    # --------------------------------------------------------
-    # Calculate report start date
-    # --------------------------------------------------------
-
     start_date = now - timedelta(
         days=months * 31
     )
 
     # ========================================================
-    # LOAD EXISTING DATA
+    # LOAD PACKAGES
     # ========================================================
 
-    packages = (
-        db.query(SubscriptionPackage)
-        .all()
+    packages_result = await db.execute(
+        select(SubscriptionPackage)
     )
 
-    subscriptions = (
-        db.query(UserSubscription)
-        .all()
+    packages = list(
+        packages_result.scalars().all()
     )
 
-    payments = (
-        db.query(Payment)
-        .all()
+    # ========================================================
+    # LOAD SUBSCRIPTIONS
+    # ========================================================
+
+    subscriptions_result = await db.execute(
+        select(UserSubscription)
+    )
+
+    subscriptions = list(
+        subscriptions_result.scalars().all()
+    )
+
+    # ========================================================
+    # LOAD PAYMENTS
+    # ========================================================
+
+    payments_result = await db.execute(
+        select(Payment)
+    )
+
+    payments = list(
+        payments_result.scalars().all()
     )
 
     # ========================================================
@@ -408,7 +451,7 @@ def get_package_sales_dashboard(
 
     for subscription in active_subscriptions:
 
-        user_id = get_user_id_from_subscription(
+        user_id = get_subscription_user_id(
             subscription
         )
 
@@ -427,9 +470,7 @@ def get_package_sales_dashboard(
 
     for package in packages:
 
-        package_id = get_object_id(
-            package
-        )
+        package_id = get_id(package)
 
         package_id_string = (
             str(package_id)
@@ -438,7 +479,7 @@ def get_package_sales_dashboard(
         )
 
         # ----------------------------------------------------
-        # Package payments
+        # Payments belonging to this package
         # ----------------------------------------------------
 
         package_payments = []
@@ -446,7 +487,7 @@ def get_package_sales_dashboard(
         for payment in successful_payments:
 
             payment_package_id = (
-                get_package_id_from_payment(
+                get_payment_package_id(
                     payment
                 )
             )
@@ -471,7 +512,7 @@ def get_package_sales_dashboard(
         )
 
         # ----------------------------------------------------
-        # Package subscriptions
+        # Subscriptions belonging to this package
         # ----------------------------------------------------
 
         package_subscriptions = []
@@ -479,7 +520,7 @@ def get_package_sales_dashboard(
         for subscription in subscriptions:
 
             subscription_package_id = (
-                get_package_id_from_subscription(
+                get_subscription_package_id(
                     subscription
                 )
             )
@@ -499,13 +540,17 @@ def get_package_sales_dashboard(
         # ----------------------------------------------------
 
         total_student_ids = set()
+
         active_student_ids_for_package = set()
+
         expired_student_ids_for_package = set()
 
         for subscription in package_subscriptions:
 
-            user_id = get_user_id_from_subscription(
-                subscription
+            user_id = (
+                get_subscription_user_id(
+                    subscription
+                )
             )
 
             if user_id is None:
@@ -523,16 +568,19 @@ def get_package_sales_dashboard(
                 subscription,
                 now,
             ):
+
                 active_student_ids_for_package.add(
                     user_id_string
                 )
+
             else:
+
                 expired_student_ids_for_package.add(
                     user_id_string
                 )
 
         # ----------------------------------------------------
-        # Package record
+        # Package row
         # ----------------------------------------------------
 
         package_rows.append(
@@ -628,12 +676,15 @@ def get_package_sales_dashboard(
     while cursor <= now:
 
         if cursor.month == 12:
+
             next_month = datetime(
                 cursor.year + 1,
                 1,
                 1,
             )
+
         else:
+
             next_month = datetime(
                 cursor.year,
                 cursor.month + 1,
@@ -641,6 +692,7 @@ def get_package_sales_dashboard(
             )
 
         month_revenue = 0.0
+
         month_sales = 0
 
         for payment in successful_payments:
@@ -687,7 +739,7 @@ def get_package_sales_dashboard(
         cursor = next_month
 
     # ========================================================
-    # PAYMENT STATUS SUMMARY
+    # PAYMENT STATUS
     # ========================================================
 
     payment_status_map: Dict[
@@ -697,19 +749,17 @@ def get_package_sales_dashboard(
 
     for payment in payments:
 
-        status_value = normalize_status(
-            get_value(
-                payment,
-                "status",
-                "payment_status",
-                default="unknown",
-            )
+        status_value = get_payment_status(
+            payment
         )
 
         if not status_value:
             status_value = "unknown"
 
-        if status_value not in payment_status_map:
+        if (
+            status_value
+            not in payment_status_map
+        ):
 
             payment_status_map[
                 status_value
@@ -725,8 +775,10 @@ def get_package_sales_dashboard(
 
         payment_status_map[
             status_value
-        ]["amount"] += get_payment_amount(
-            payment
+        ]["amount"] += (
+            get_payment_amount(
+                payment
+            )
         )
 
     payment_status = list(
@@ -754,67 +806,76 @@ def get_package_sales_dashboard(
         sorted_payments[:25]
     )
 
+    # --------------------------------------------------------
+    # Load users and packages once
+    # --------------------------------------------------------
+
+    users_result = await db.execute(
+        select(User)
+    )
+
+    users = list(
+        users_result.scalars().all()
+    )
+
+    users_by_id = {
+        str(get_id(user)): user
+        for user in users
+        if get_id(user) is not None
+    }
+
+    packages_by_id = {
+        str(get_id(package)): package
+        for package in packages
+        if get_id(package) is not None
+    }
+
+    # --------------------------------------------------------
+    # Build recent sales
+    # --------------------------------------------------------
+
     recent_sales = []
 
     for payment in recent_payment_objects:
 
-        user_id = get_user_id_from_payment(
+        user_id = get_payment_user_id(
             payment
         )
 
-        package_id = get_package_id_from_payment(
+        package_id = get_payment_package_id(
             payment
         )
 
-        # ----------------------------------------------------
-        # Student
-        # ----------------------------------------------------
-
-        user = None
-
-        if user_id is not None:
-
-            user = (
-                db.query(User)
-                .filter(
-                    User.id == user_id
-                )
-                .first()
+        user = (
+            users_by_id.get(
+                str(user_id)
             )
+            if user_id is not None
+            else None
+        )
 
-        # ----------------------------------------------------
-        # Package
-        # ----------------------------------------------------
-
-        package = None
-
-        if package_id is not None:
-
-            package = (
-                db.query(
-                    SubscriptionPackage
-                )
-                .filter(
-                    SubscriptionPackage.id
-                    == package_id
-                )
-                .first()
+        package = (
+            packages_by_id.get(
+                str(package_id)
             )
+            if package_id is not None
+            else None
+        )
 
         recent_sales.append(
             {
-                "id": get_object_id(
-                    payment
-                ),
+                "id": get_id(payment),
 
                 "user_id": user_id,
 
                 "student_name": (
-                    get_value(
-                        user,
-                        "full_name",
-                        "name",
-                        default="Student",
+                    str(
+                        get_value(
+                            user,
+                            "full_name",
+                            "name",
+                            default="Student",
+                        )
                     )
                     if user
                     else "Student"
@@ -901,19 +962,7 @@ def get_package_sales_dashboard(
         )
 
     # ========================================================
-    # PROFIT
-    # ========================================================
-    #
-    # IMPORTANT:
-    # At this stage the database model information available
-    # does not establish a package cost/expense field.
-    #
-    # Therefore we do NOT invent an expense value.
-    #
-    # "gross_revenue" is the actual successful payment revenue.
-    # "profit" is returned as None until an actual expense/cost
-    # field exists in the database.
-    #
+    # RESPONSE
     # ========================================================
 
     return {
@@ -932,6 +981,8 @@ def get_package_sales_dashboard(
 
             "gross_revenue": total_revenue,
 
+            # No expense/cost field has been established,
+            # therefore do not fabricate a profit value.
             "profit": None,
 
             "active_students": len(
