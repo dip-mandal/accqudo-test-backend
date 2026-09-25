@@ -9,6 +9,7 @@ from app.api.v1.endpoints import (
     storage,
     super_admin,
     team,
+    sells,
 )
 
 api_router = APIRouter()
@@ -23,6 +24,9 @@ api_router.include_router(analytics.router, prefix="/analytics", tags=["Analytic
 
 
 api_router.include_router(admin.router, prefix="/admin", tags=["Admin Studio & CMS"])
+
+
+api_router.include_router(sells.router)
 
 
 api_router.include_router(
