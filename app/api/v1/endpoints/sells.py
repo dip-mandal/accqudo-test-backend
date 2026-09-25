@@ -1,16 +1,18 @@
 from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.api.v1.deps import get_db, get_current_user
 
 from app.models.user import User
-from app.models.package import Package
-from app.models.payment import Payment
-from app.models.subscription import Subscription
+from app.models.package import (
+    SubscriptionPackage,
+    UserSubscription,
+    Payment,
+    RazorpayOrder,
+)
 
 
 router = APIRouter(
@@ -20,92 +22,7 @@ router = APIRouter(
 
 
 # ============================================================
-# Authorization
-# ============================================================
-
-def require_admin_or_super_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
-    """
-    Only ADMIN and SUPER_ADMIN can access package sales.
-    """
-
-    role = str(
-        getattr(current_user, "role", "") or ""
-    ).strip().upper()
-
-    # Support both the uppercase roles used by the current
-    # Team Portal and lowercase roles if the database stores
-    # them that way.
-    if role not in {
-        "ADMIN",
-        "SUPER_ADMIN",
-    }:
-        raise HTTPException(
-            status_code=403,
-            detail="Admin or Super Admin access required.",
-        )
-
-    return current_user
-
-
-# ============================================================
-# Helpers
-# ============================================================
-
-def safe_float(value: Any) -> float:
-    try:
-        return float(value or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def safe_int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def serialize_datetime(value: Any) -> str | None:
-    if value is None:
-        return None
-
-    if isinstance(value, datetime):
-        return value.isoformat()
-
-    return str(value)
-
-
-def get_attr(
-    obj: Any,
-    *names: str,
-    default: Any = None,
-) -> Any:
-    """
-    Safely retrieve a field from an existing ORM model.
-
-    This keeps the sales endpoint tolerant of small naming
-    differences in the existing models without changing
-    those models.
-    """
-
-    for name in names:
-        if hasattr(obj, name):
-            value = getattr(obj, name)
-
-            if value is not None:
-                return value
-
-    return default
-
-
-def normalized_status(value: Any) -> str:
-    return str(value or "").strip().lower()
-
-
-# ============================================================
-# Successful payment statuses
+# Constants
 # ============================================================
 
 SUCCESSFUL_PAYMENT_STATUSES = {
@@ -116,12 +33,270 @@ SUCCESSFUL_PAYMENT_STATUSES = {
     "captured",
 }
 
-FAILED_PAYMENT_STATUSES = {
-    "failed",
-    "failure",
-    "cancelled",
-    "canceled",
+ACTIVE_SUBSCRIPTION_STATUSES = {
+    "active",
+    "paid",
+    "success",
+    "successful",
+    "completed",
 }
+
+
+# ============================================================
+# Authorization
+# ============================================================
+
+def require_admin_or_super_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    """
+    Package sales information is restricted to
+    ADMIN and SUPER_ADMIN users.
+    """
+
+    role = str(
+        getattr(current_user, "role", "") or ""
+    ).strip().upper()
+
+    if role not in {
+        "ADMIN",
+        "SUPER_ADMIN",
+        "SUPERADMIN",
+    }:
+        raise HTTPException(
+            status_code=403,
+            detail="Admin or Super Admin access required.",
+        )
+
+    return current_user
+
+
+# ============================================================
+# Generic helpers
+# ============================================================
+
+def get_value(
+    obj: Any,
+    *field_names: str,
+    default: Any = None,
+) -> Any:
+    """
+    Read the first available/non-null field from an ORM object.
+
+    This allows the endpoint to work with the existing models
+    without modifying their field names.
+    """
+
+    if obj is None:
+        return default
+
+    for field_name in field_names:
+        if hasattr(obj, field_name):
+            value = getattr(obj, field_name)
+
+            if value is not None:
+                return value
+
+    return default
+
+
+def to_float(value: Any) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def to_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_status(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def serialize_datetime(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value.isoformat()
+
+    return str(value)
+
+
+def get_object_id(obj: Any) -> Any:
+    return getattr(obj, "id", None)
+
+
+def is_successful_payment(payment: Any) -> bool:
+    status_value = normalize_status(
+        get_value(
+            payment,
+            "status",
+            "payment_status",
+            default="",
+        )
+    )
+
+    return status_value in SUCCESSFUL_PAYMENT_STATUSES
+
+
+def is_active_subscription(
+    subscription: Any,
+    now: datetime,
+) -> bool:
+
+    status_value = normalize_status(
+        get_value(
+            subscription,
+            "status",
+            "subscription_status",
+            default="",
+        )
+    )
+
+    is_active = get_value(
+        subscription,
+        "is_active",
+        "isActive",
+        default=None,
+    )
+
+    # Explicit false always means inactive.
+    if is_active is False:
+        return False
+
+    active = False
+
+    if is_active is True:
+        active = True
+
+    elif status_value in ACTIVE_SUBSCRIPTION_STATUSES:
+        active = True
+
+    # Check expiry/end date if the model contains one.
+    expiry = get_value(
+        subscription,
+        "end_date",
+        "endDate",
+        "expires_at",
+        "expiry_date",
+        "valid_until",
+        default=None,
+    )
+
+    if isinstance(expiry, datetime):
+        if expiry < now:
+            return False
+
+    return active
+
+
+def get_package_title(package: Any) -> str:
+    return str(
+        get_value(
+            package,
+            "title",
+            "name",
+            "package_name",
+            "display_name",
+            default="Package",
+        )
+    )
+
+
+def get_package_price(package: Any) -> float:
+    return to_float(
+        get_value(
+            package,
+            "price_inr",
+            "price",
+            "amount",
+            "amount_inr",
+            "selling_price",
+            default=0,
+        )
+    )
+
+
+def get_payment_amount(payment: Any) -> float:
+    return to_float(
+        get_value(
+            payment,
+            "amount_inr",
+            "amount",
+            "price",
+            "amount_paid",
+            "paid_amount",
+            default=0,
+        )
+    )
+
+
+def get_package_id_from_payment(payment: Any) -> Any:
+    return get_value(
+        payment,
+        "package_id",
+        "packageId",
+        "subscription_package_id",
+        "subscriptionPackageId",
+        default=None,
+    )
+
+
+def get_package_id_from_subscription(
+    subscription: Any,
+) -> Any:
+    return get_value(
+        subscription,
+        "package_id",
+        "packageId",
+        "subscription_package_id",
+        "subscriptionPackageId",
+        default=None,
+    )
+
+
+def get_user_id_from_subscription(
+    subscription: Any,
+) -> Any:
+    return get_value(
+        subscription,
+        "user_id",
+        "userId",
+        "student_id",
+        "studentId",
+        default=None,
+    )
+
+
+def get_user_id_from_payment(
+    payment: Any,
+) -> Any:
+    return get_value(
+        payment,
+        "user_id",
+        "userId",
+        "student_id",
+        "studentId",
+        default=None,
+    )
+
+
+def get_created_at(obj: Any) -> Any:
+    return get_value(
+        obj,
+        "created_at",
+        "createdAt",
+        "paid_at",
+        "payment_date",
+        "purchased_at",
+        default=None,
+    )
 
 
 # ============================================================
@@ -142,151 +317,88 @@ def get_package_sales_dashboard(
     ),
 ) -> Dict[str, Any]:
 
-    # --------------------------------------------------------
-    # Current time
-    # --------------------------------------------------------
-
     now = datetime.utcnow()
+
+    # --------------------------------------------------------
+    # Calculate report start date
+    # --------------------------------------------------------
 
     start_date = now - timedelta(
         days=months * 31
     )
 
     # ========================================================
-    # PACKAGES
+    # LOAD EXISTING DATA
     # ========================================================
 
     packages = (
-        db.query(Package)
-        .order_by(
-            Package.created_at.desc()
-        )
+        db.query(SubscriptionPackage)
         .all()
     )
+
+    subscriptions = (
+        db.query(UserSubscription)
+        .all()
+    )
+
+    payments = (
+        db.query(Payment)
+        .all()
+    )
+
+    # ========================================================
+    # ACTIVE PACKAGES
+    # ========================================================
 
     active_packages = 0
 
     for package in packages:
-        is_active = get_attr(
+
+        package_active = get_value(
             package,
             "is_active",
             "isActive",
             default=True,
         )
 
-        if bool(is_active):
+        if bool(package_active):
             active_packages += 1
 
     # ========================================================
-    # PAYMENTS
+    # SUCCESSFUL PAYMENTS
     # ========================================================
 
-    all_payments = (
-        db.query(Payment)
-        .all()
+    successful_payments = [
+        payment
+        for payment in payments
+        if is_successful_payment(payment)
+    ]
+
+    # ========================================================
+    # TOTAL REVENUE
+    # ========================================================
+
+    total_revenue = sum(
+        get_payment_amount(payment)
+        for payment in successful_payments
     )
-
-    successful_payments = []
-
-    for payment in all_payments:
-
-        status_value = normalized_status(
-            get_attr(
-                payment,
-                "status",
-                default="",
-            )
-        )
-
-        if status_value in SUCCESSFUL_PAYMENT_STATUSES:
-            successful_payments.append(
-                payment
-            )
-
-    # --------------------------------------------------------
-    # Total revenue
-    # --------------------------------------------------------
-
-    total_revenue = 0.0
-
-    for payment in successful_payments:
-
-        amount = get_attr(
-            payment,
-            "amount_inr",
-            "amount",
-            "price",
-            "amount_paid",
-            default=0,
-        )
-
-        total_revenue += safe_float(amount)
 
     total_sales = len(
         successful_payments
     )
 
     # ========================================================
-    # SUBSCRIPTIONS
+    # ACTIVE SUBSCRIPTIONS
     # ========================================================
 
-    all_subscriptions = (
-        db.query(Subscription)
-        .all()
-    )
-
-    active_subscriptions = []
-
-    for subscription in all_subscriptions:
-
-        is_active = get_attr(
+    active_subscriptions = [
+        subscription
+        for subscription in subscriptions
+        if is_active_subscription(
             subscription,
-            "is_active",
-            "isActive",
-            default=None,
+            now,
         )
-
-        status_value = normalized_status(
-            get_attr(
-                subscription,
-                "status",
-                default="",
-            )
-        )
-
-        end_date = get_attr(
-            subscription,
-            "end_date",
-            "endDate",
-            "expires_at",
-            "expiry_date",
-            default=None,
-        )
-
-        currently_active = False
-
-        if is_active is True:
-            currently_active = True
-
-        elif status_value in {
-            "active",
-            "paid",
-            "success",
-            "successful",
-        }:
-            currently_active = True
-
-        if (
-            end_date is not None
-            and isinstance(end_date, datetime)
-            and end_date < now
-        ):
-            currently_active = False
-
-        if currently_active:
-            active_subscriptions.append(
-                subscription
-            )
+    ]
 
     # ========================================================
     # UNIQUE ACTIVE STUDENTS
@@ -296,13 +408,8 @@ def get_package_sales_dashboard(
 
     for subscription in active_subscriptions:
 
-        user_id = get_attr(
-            subscription,
-            "user_id",
-            "userId",
-            "student_id",
-            "studentId",
-            default=None,
+        user_id = get_user_id_from_subscription(
+            subscription
         )
 
         if user_id is not None:
@@ -320,10 +427,8 @@ def get_package_sales_dashboard(
 
     for package in packages:
 
-        package_id = getattr(
-            package,
-            "id",
-            None,
+        package_id = get_object_id(
+            package
         )
 
         package_id_string = (
@@ -333,18 +438,17 @@ def get_package_sales_dashboard(
         )
 
         # ----------------------------------------------------
-        # Package sales
+        # Package payments
         # ----------------------------------------------------
 
         package_payments = []
 
         for payment in successful_payments:
 
-            payment_package_id = get_attr(
-                payment,
-                "package_id",
-                "packageId",
-                default=None,
+            payment_package_id = (
+                get_package_id_from_payment(
+                    payment
+                )
             )
 
             if (
@@ -361,22 +465,10 @@ def get_package_sales_dashboard(
             package_payments
         )
 
-        package_revenue = 0.0
-
-        for payment in package_payments:
-
-            amount = get_attr(
-                payment,
-                "amount_inr",
-                "amount",
-                "price",
-                "amount_paid",
-                default=0,
-            )
-
-            package_revenue += safe_float(
-                amount
-            )
+        package_revenue = sum(
+            get_payment_amount(payment)
+            for payment in package_payments
+        )
 
         # ----------------------------------------------------
         # Package subscriptions
@@ -384,13 +476,12 @@ def get_package_sales_dashboard(
 
         package_subscriptions = []
 
-        for subscription in all_subscriptions:
+        for subscription in subscriptions:
 
-            subscription_package_id = get_attr(
-                subscription,
-                "package_id",
-                "packageId",
-                default=None,
+            subscription_package_id = (
+                get_package_id_from_subscription(
+                    subscription
+                )
             )
 
             if (
@@ -404,22 +495,17 @@ def get_package_sales_dashboard(
                 )
 
         # ----------------------------------------------------
-        # Unique students
+        # Student counts
         # ----------------------------------------------------
 
-        all_student_ids = set()
+        total_student_ids = set()
         active_student_ids_for_package = set()
         expired_student_ids_for_package = set()
 
         for subscription in package_subscriptions:
 
-            user_id = get_attr(
-                subscription,
-                "user_id",
-                "userId",
-                "student_id",
-                "studentId",
-                default=None,
+            user_id = get_user_id_from_subscription(
+                subscription
             )
 
             if user_id is None:
@@ -429,55 +515,14 @@ def get_package_sales_dashboard(
                 user_id
             )
 
-            all_student_ids.add(
+            total_student_ids.add(
                 user_id_string
             )
 
-            is_active = get_attr(
+            if is_active_subscription(
                 subscription,
-                "is_active",
-                "isActive",
-                default=None,
-            )
-
-            status_value = normalized_status(
-                get_attr(
-                    subscription,
-                    "status",
-                    default="",
-                )
-            )
-
-            end_date = get_attr(
-                subscription,
-                "end_date",
-                "endDate",
-                "expires_at",
-                "expiry_date",
-                default=None,
-            )
-
-            is_subscription_active = False
-
-            if is_active is True:
-                is_subscription_active = True
-
-            elif status_value in {
-                "active",
-                "paid",
-                "success",
-                "successful",
-            }:
-                is_subscription_active = True
-
-            if (
-                end_date is not None
-                and isinstance(end_date, datetime)
-                and end_date < now
+                now,
             ):
-                is_subscription_active = False
-
-            if is_subscription_active:
                 active_student_ids_for_package.add(
                     user_id_string
                 )
@@ -487,76 +532,79 @@ def get_package_sales_dashboard(
                 )
 
         # ----------------------------------------------------
-        # Package data
+        # Package record
         # ----------------------------------------------------
 
         package_rows.append(
             {
                 "id": package_id,
-                "title": str(
-                    get_attr(
-                        package,
-                        "title",
-                        "name",
-                        default="Package",
-                    )
+
+                "title": get_package_title(
+                    package
                 ),
-                "description": get_attr(
+
+                "description": get_value(
                     package,
                     "description",
                     default=None,
                 ),
+
                 "tier": str(
-                    get_attr(
+                    get_value(
                         package,
                         "tier",
+                        "package_tier",
                         "package_type",
                         "type",
                         default="",
                     )
                 ),
-                "price": safe_float(
-                    get_attr(
-                        package,
-                        "price_inr",
-                        "price",
-                        "amount",
-                        default=0,
-                    )
+
+                "price": get_package_price(
+                    package
                 ),
-                "validity_days": safe_int(
-                    get_attr(
+
+                "validity_days": to_int(
+                    get_value(
                         package,
                         "validity_days",
                         "validityDays",
                         "duration_days",
+                        "duration",
                         default=0,
                     )
                 ),
+
                 "is_active": bool(
-                    get_attr(
+                    get_value(
                         package,
                         "is_active",
                         "isActive",
                         default=True,
                     )
                 ),
+
                 "created_at": serialize_datetime(
-                    get_attr(
+                    get_value(
                         package,
                         "created_at",
                         "createdAt",
                         default=None,
                     )
                 ),
+
                 "sales_count": sales_count,
+
                 "revenue": package_revenue,
+
                 "active_students": len(
                     active_student_ids_for_package
                 ),
+
                 "total_students": len(
-                    all_student_ids
+                    total_student_ids
                 ),
+
                 "expired_students": len(
                     expired_student_ids_for_package
                 ),
@@ -597,13 +645,8 @@ def get_package_sales_dashboard(
 
         for payment in successful_payments:
 
-            created_at = get_attr(
-                payment,
-                "created_at",
-                "createdAt",
-                "paid_at",
-                "payment_date",
-                default=None,
+            created_at = get_created_at(
+                payment
             )
 
             if not isinstance(
@@ -619,17 +662,10 @@ def get_package_sales_dashboard(
 
                 month_sales += 1
 
-                amount = get_attr(
-                    payment,
-                    "amount_inr",
-                    "amount",
-                    "price",
-                    "amount_paid",
-                    default=0,
-                )
-
-                month_revenue += safe_float(
-                    amount
+                month_revenue += (
+                    get_payment_amount(
+                        payment
+                    )
                 )
 
         monthly_revenue.append(
@@ -637,10 +673,13 @@ def get_package_sales_dashboard(
                 "month": cursor.strftime(
                     "%Y-%m"
                 ),
+
                 "label": cursor.strftime(
                     "%b %Y"
                 ),
+
                 "sales": month_sales,
+
                 "revenue": month_revenue,
             }
         )
@@ -656,12 +695,13 @@ def get_package_sales_dashboard(
         Dict[str, Any],
     ] = {}
 
-    for payment in all_payments:
+    for payment in payments:
 
-        status_value = normalized_status(
-            get_attr(
+        status_value = normalize_status(
+            get_value(
                 payment,
                 "status",
+                "payment_status",
                 default="unknown",
             )
         )
@@ -670,6 +710,7 @@ def get_package_sales_dashboard(
             status_value = "unknown"
 
         if status_value not in payment_status_map:
+
             payment_status_map[
                 status_value
             ] = {
@@ -684,15 +725,8 @@ def get_package_sales_dashboard(
 
         payment_status_map[
             status_value
-        ]["amount"] += safe_float(
-            get_attr(
-                payment,
-                "amount_inr",
-                "amount",
-                "price",
-                "amount_paid",
-                default=0,
-            )
+        ]["amount"] += get_payment_amount(
+            payment
         )
 
     payment_status = list(
@@ -703,42 +737,43 @@ def get_package_sales_dashboard(
     # RECENT SALES
     # ========================================================
 
-    recent_payment_objects = sorted(
-        all_payments,
+    sorted_payments = sorted(
+        payments,
         key=lambda payment: (
-            get_attr(
-                payment,
-                "created_at",
-                "createdAt",
-                "paid_at",
-                default=datetime.min,
+            get_created_at(payment)
+            if isinstance(
+                get_created_at(payment),
+                datetime,
             )
-            or datetime.min
+            else datetime.min
         ),
         reverse=True,
-    )[:25]
+    )
+
+    recent_payment_objects = (
+        sorted_payments[:25]
+    )
 
     recent_sales = []
 
     for payment in recent_payment_objects:
 
-        user_id = get_attr(
-            payment,
-            "user_id",
-            "userId",
-            default=None,
+        user_id = get_user_id_from_payment(
+            payment
         )
 
-        package_id = get_attr(
-            payment,
-            "package_id",
-            "packageId",
-            default=None,
+        package_id = get_package_id_from_payment(
+            payment
         )
+
+        # ----------------------------------------------------
+        # Student
+        # ----------------------------------------------------
 
         user = None
 
         if user_id is not None:
+
             user = (
                 db.query(User)
                 .filter(
@@ -747,27 +782,35 @@ def get_package_sales_dashboard(
                 .first()
             )
 
+        # ----------------------------------------------------
+        # Package
+        # ----------------------------------------------------
+
         package = None
 
         if package_id is not None:
+
             package = (
-                db.query(Package)
+                db.query(
+                    SubscriptionPackage
+                )
                 .filter(
-                    Package.id == package_id
+                    SubscriptionPackage.id
+                    == package_id
                 )
                 .first()
             )
 
         recent_sales.append(
             {
-                "id": getattr(
-                    payment,
-                    "id",
-                    None,
+                "id": get_object_id(
+                    payment
                 ),
+
                 "user_id": user_id,
+
                 "student_name": (
-                    get_attr(
+                    get_value(
                         user,
                         "full_name",
                         "name",
@@ -776,8 +819,9 @@ def get_package_sales_dashboard(
                     if user
                     else "Student"
                 ),
+
                 "student_email": (
-                    get_attr(
+                    get_value(
                         user,
                         "email",
                         default=None,
@@ -785,63 +829,57 @@ def get_package_sales_dashboard(
                     if user
                     else None
                 ),
+
                 "package_id": package_id,
+
                 "package_title": (
-                    get_attr(
-                        package,
-                        "title",
-                        "name",
-                        default="Package",
+                    get_package_title(
+                        package
                     )
                     if package
                     else "Package"
                 ),
-                "amount": safe_float(
-                    get_attr(
-                        payment,
-                        "amount_inr",
-                        "amount",
-                        "price",
-                        "amount_paid",
-                        default=0,
-                    )
+
+                "amount": get_payment_amount(
+                    payment
                 ),
+
                 "currency": str(
-                    get_attr(
+                    get_value(
                         payment,
                         "currency",
                         default="INR",
                     )
                 ),
+
                 "status": str(
-                    get_attr(
+                    get_value(
                         payment,
                         "status",
+                        "payment_status",
                         default="unknown",
                     )
                 ),
-                "razorpay_order_id": get_attr(
+
+                "razorpay_order_id": get_value(
                     payment,
                     "razorpay_order_id",
                     "order_id",
                     "razorpayOrderId",
-                    default="",
+                    default=None,
                 ),
-                "razorpay_payment_id": get_attr(
+
+                "razorpay_payment_id": get_value(
                     payment,
                     "razorpay_payment_id",
                     "payment_id",
                     "razorpayPaymentId",
                     default=None,
                 ),
+
                 "created_at": serialize_datetime(
-                    get_attr(
-                        payment,
-                        "created_at",
-                        "createdAt",
-                        "paid_at",
-                        "payment_date",
-                        default=None,
+                    get_created_at(
+                        payment
                     )
                 ),
             }
@@ -854,6 +892,7 @@ def get_package_sales_dashboard(
     top_package = None
 
     if package_rows:
+
         top_package = max(
             package_rows,
             key=lambda item: item[
@@ -862,7 +901,19 @@ def get_package_sales_dashboard(
         )
 
     # ========================================================
-    # RETURN
+    # PROFIT
+    # ========================================================
+    #
+    # IMPORTANT:
+    # At this stage the database model information available
+    # does not establish a package cost/expense field.
+    #
+    # Therefore we do NOT invent an expense value.
+    #
+    # "gross_revenue" is the actual successful payment revenue.
+    # "profit" is returned as None until an actual expense/cost
+    # field exists in the database.
+    #
     # ========================================================
 
     return {
@@ -870,14 +921,23 @@ def get_package_sales_dashboard(
 
         "overview": {
             "active_packages": active_packages,
+
             "total_packages": len(
                 packages
             ),
+
             "total_sales": total_sales,
+
             "total_revenue": total_revenue,
+
+            "gross_revenue": total_revenue,
+
+            "profit": None,
+
             "active_students": len(
                 active_subscriptions
             ),
+
             "unique_active_students": len(
                 active_student_ids
             ),
