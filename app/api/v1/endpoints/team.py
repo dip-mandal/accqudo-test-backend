@@ -253,7 +253,6 @@ async def create_question(
 
     question = Question(
         topic_id=topic_id,
-        created_by=current_user.id,
         question_type=question_type,
         question_text=question_text,
         options=payload.get("options"),
@@ -370,7 +369,6 @@ async def assemble_test(
 
     test = Test(
         exam_id=exam_id,
-        created_by=current_user.id,
         title=title,
         duration_minutes=duration_minutes,
         total_marks=total_marks,
@@ -383,7 +381,6 @@ async def assemble_test(
         db.add(
             TestQuestion(
                 test_id=test.id,
-                added_by=current_user.id,
                 question_id=question_id,
                 order=order,
                 marks=marks,
@@ -474,7 +471,6 @@ async def create_exam(
 
     exam = Exam(
         title=title,
-        created_by=current_user.id,
         code=code,
     )
 
@@ -521,7 +517,6 @@ async def create_subject(
 
     subject = Subject(
         exam_id=exam_id,
-        created_by=current_user.id,
         name=name,
     )
 
@@ -567,7 +562,6 @@ async def create_chapter(
 
     chapter = Chapter(
         subject_id=subject_id,
-        created_by=current_user.id,
         name=name,
     )
 
@@ -613,7 +607,6 @@ async def create_topic(
 
     topic = Topic(
         chapter_id=chapter_id,
-        created_by=current_user.id,
         name=name,
     )
 
