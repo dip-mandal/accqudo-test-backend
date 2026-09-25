@@ -21,7 +21,7 @@ from app.core.security import get_current_user
 from app.models.user import User
 
 router = APIRouter(prefix="/team/contribution", tags=["Team - Contribution"])
-ALLOWED_ROLES = {"ADMIN", "SUPER_ADMIN", "SUPERADMIN"}
+ALLOWED_ROLES = {"ADMIN", "SUPER_ADMIN", "SUPERADMIN", "TEAM"}
 
 
 def norm(value: Any) -> str:
