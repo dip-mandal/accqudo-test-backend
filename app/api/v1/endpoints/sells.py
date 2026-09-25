@@ -1,25 +1,40 @@
+"""
+Package Sales / Sells Dashboard
+
+This endpoint intentionally supports both package systems currently present
+in the database:
+
+CURRENT:
+    packages
+        -> payments
+        -> subscriptions
+
+LEGACY:
+    subscription_packages
+        -> razorpay_orders
+        -> user_subscriptions
+
+The dashboard automatically selects the sales source that actually contains
+successful package sales, preventing the dashboard from incorrectly showing
+zero when the data exists in the legacy tables.
+
+Route:
+    GET /api/v1/team/sells/dashboard
+"""
+
+from __future__ import annotations
+
+from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.v1.deps import get_db, get_current_user
-
+from app.core.database import get_db
+from app.core.security import get_current_user
 from app.models.user import User
-
-# These are the models that map to the current sales tables:
-#
-# packages
-# payments
-# subscriptions
-#
-from app.models.payment import (
-    Package,
-    Payment,
-    Subscription,
-)
 
 
 router = APIRouter(
@@ -28,1061 +43,1298 @@ router = APIRouter(
 )
 
 
-# ============================================================
-# Constants
-# ============================================================
+# ============================================================================
+# CONSTANTS
+# ============================================================================
 
-SUCCESSFUL_PAYMENT_STATUSES = {
+CURRENT_SUCCESS_STATUSES = {
     "SUCCESS",
     "PAID",
     "CAPTURED",
     "COMPLETED",
-    "SUCCESSFUL",
 }
 
-ACTIVE_SUBSCRIPTION_STATUSES = {
-    "ACTIVE",
+LEGACY_SUCCESS_STATUSES = {
+    "SUCCESS",
+    "PAID",
+    "CAPTURED",
+    "COMPLETED",
 }
 
+ACTIVE_SUBSCRIPTION_STATUS = "ACTIVE"
 
-# ============================================================
-# Authorization
-# ============================================================
 
-def require_admin_or_super_admin(
-    current_user: User = Depends(get_current_user),
-) -> User:
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def normalize(value: Any) -> str:
     """
-    Only ADMIN and SUPER_ADMIN can access package sales.
+    Safely convert enums / strings into uppercase plain strings.
     """
+    if value is None:
+        return ""
 
-    role = str(
-        getattr(current_user, "role", "") or ""
-    ).strip().upper()
+    raw_value = getattr(value, "value", value)
 
-    if role not in {
-        "ADMIN",
-        "SUPER_ADMIN",
-        "SUPERADMIN",
-    }:
-        raise HTTPException(
-            status_code=403,
-            detail="Admin or Super Admin access required.",
-        )
-
-    return current_user
+    return str(raw_value).strip().upper()
 
 
-# ============================================================
-# Generic helpers
-# ============================================================
-
-def get_value(
-    obj: Any,
-    *field_names: str,
-    default: Any = None,
-) -> Any:
+def money(value: Any) -> float:
     """
-    Safely get the first available attribute.
+    Safely convert database numeric values into rupees.
     """
+    if value is None:
+        return 0.0
 
-    if obj is None:
-        return default
-
-    for field_name in field_names:
-        if hasattr(obj, field_name):
-            value = getattr(obj, field_name)
-
-            if value is not None:
-                return value
-
-    return default
-
-
-def to_float(value: Any) -> float:
     try:
-        return float(value or 0)
+        return round(float(value), 2)
     except (TypeError, ValueError):
         return 0.0
 
 
-def to_int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def normalize_status(value: Any) -> str:
+def iso_datetime(value: Any) -> Optional[str]:
     """
-    Supports SQLAlchemy Enum values as well as strings.
+    Convert datetime values into ISO strings.
     """
-
-    if value is None:
-        return ""
-
-    # Python enum
-    enum_value = getattr(
-        value,
-        "value",
-        None,
-    )
-
-    if enum_value is not None:
-        return str(
-            enum_value
-        ).strip().upper()
-
-    return str(
-        value
-    ).strip().upper()
-
-
-def serialize_datetime(
-    value: Any,
-) -> Optional[str]:
-
     if value is None:
         return None
 
-    if isinstance(
-        value,
-        datetime,
-    ):
+    if isinstance(value, datetime):
         return value.isoformat()
 
     return str(value)
 
 
-def get_id(
-    obj: Any,
-) -> Any:
-    return getattr(
-        obj,
-        "id",
-        None,
+def month_label(year: int, month: int) -> str:
+    """
+    Return YYYY-MM.
+    """
+    return f"{year:04d}-{month:02d}"
+
+
+def get_month_starts(months: int) -> List[datetime]:
+    """
+    Generate month-start dates ending with the current month.
+    """
+    now = datetime.utcnow()
+
+    current_month_start = datetime(
+        now.year,
+        now.month,
+        1,
     )
 
+    result: List[datetime] = []
 
-# ============================================================
-# Package helpers
-# ============================================================
+    year = current_month_start.year
+    month = current_month_start.month
 
-def get_package_title(
-    package: Any,
-) -> str:
+    for offset in range(months - 1, -1, -1):
+        y = year
+        m = month - offset
 
-    return str(
-        get_value(
-            package,
-            "title",
-            "name",
-            default="Package",
-        )
-    )
+        while m <= 0:
+            m += 12
+            y -= 1
+
+        result.append(datetime(y, m, 1))
+
+    return result
 
 
-def get_package_price_paise(
-    package: Any,
+def authorized_role(current_user: User) -> bool:
+    """
+    Allow both uppercase and lowercase role representations because the
+    database currently stores role as VARCHAR.
+    """
+    role = normalize(getattr(current_user, "role", None))
+
+    return role in {
+        "ADMIN",
+        "SUPER_ADMIN",
+        "SUPERADMIN",
+    }
+
+
+# ============================================================================
+# DATABASE SOURCE DETECTION
+# ============================================================================
+
+async def get_table_count(
+    db: AsyncSession,
+    table_name: str,
 ) -> int:
+    """
+    Return row count for one of the known package/sales tables.
 
-    return to_int(
-        get_value(
-            package,
-            "price_paise",
-            default=0,
+    Table names are hardcoded internally and never come from user input.
+    """
+    allowed_tables = {
+        "packages",
+        "subscription_packages",
+        "payments",
+        "razorpay_orders",
+        "subscriptions",
+        "user_subscriptions",
+    }
+
+    if table_name not in allowed_tables:
+        raise ValueError(f"Unsupported table: {table_name}")
+
+    result = await db.execute(
+        text(f"SELECT COUNT(*) AS total FROM `{table_name}`")
+    )
+
+    row = result.mappings().first()
+
+    if not row:
+        return 0
+
+    return int(row["total"] or 0)
+
+
+async def detect_sales_source(
+    db: AsyncSession,
+    start_date: datetime,
+) -> Dict[str, str]:
+    """
+    Determine which package/payment/subscription system contains the real
+    sales data.
+
+    Priority:
+        1. New payments table if it contains successful payments.
+        2. Legacy razorpay_orders if it contains successful payments.
+        3. Otherwise whichever package table contains packages.
+
+    This avoids the old problem where the dashboard showed zero simply
+    because it was reading the wrong package system.
+    """
+
+    # ----------------------------------------------------------------------
+    # Check CURRENT payment system
+    # ----------------------------------------------------------------------
+
+    current_payment_result = await db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS total
+            FROM payments
+            WHERE created_at >= :start_date
+              AND UPPER(CAST(status AS CHAR)) IN
+                  ('SUCCESS', 'PAID', 'CAPTURED', 'COMPLETED')
+            """
+        ),
+        {
+            "start_date": start_date,
+        },
+    )
+
+    current_payment_row = current_payment_result.mappings().first()
+
+    current_success_count = int(
+        current_payment_row["total"] or 0
+    ) if current_payment_row else 0
+
+    # ----------------------------------------------------------------------
+    # Check LEGACY payment system
+    # ----------------------------------------------------------------------
+
+    legacy_payment_result = await db.execute(
+        text(
+            """
+            SELECT COUNT(*) AS total
+            FROM razorpay_orders
+            WHERE created_at >= :start_date
+              AND UPPER(CAST(status AS CHAR)) IN
+                  ('SUCCESS', 'PAID', 'CAPTURED', 'COMPLETED')
+            """
+        ),
+        {
+            "start_date": start_date,
+        },
+    )
+
+    legacy_payment_row = legacy_payment_result.mappings().first()
+
+    legacy_success_count = int(
+        legacy_payment_row["total"] or 0
+    ) if legacy_payment_row else 0
+
+    # ----------------------------------------------------------------------
+    # Select source
+    # ----------------------------------------------------------------------
+
+    if current_success_count > 0:
+        return {
+            "package_source": "packages",
+            "payment_source": "payments",
+            "subscription_source": "subscriptions",
+        }
+
+    if legacy_success_count > 0:
+        return {
+            "package_source": "subscription_packages",
+            "payment_source": "razorpay_orders",
+            "subscription_source": "user_subscriptions",
+        }
+
+    # ----------------------------------------------------------------------
+    # No successful payment found.
+    #
+    # Use whichever package table actually contains catalog data.
+    # ----------------------------------------------------------------------
+
+    current_packages = await get_table_count(
+        db,
+        "packages",
+    )
+
+    legacy_packages = await get_table_count(
+        db,
+        "subscription_packages",
+    )
+
+    if current_packages > 0:
+        return {
+            "package_source": "packages",
+            "payment_source": "payments",
+            "subscription_source": "subscriptions",
+        }
+
+    return {
+        "package_source": "subscription_packages",
+        "payment_source": "razorpay_orders",
+        "subscription_source": "user_subscriptions",
+    }
+
+
+# ============================================================================
+# PACKAGE QUERIES
+# ============================================================================
+
+async def fetch_current_packages(
+    db: AsyncSession,
+) -> List[Dict[str, Any]]:
+    """
+    Read packages table.
+    """
+
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                exam_id,
+                title,
+                description,
+                price_paise,
+                discount_paise,
+                expiry_type,
+                validity_days,
+                fixed_expiry_date,
+                is_active,
+                created_at,
+                updated_at
+            FROM packages
+            ORDER BY created_at DESC, id DESC
+            """
         )
     )
 
+    rows = result.mappings().all()
 
-def paise_to_rupees(
-    value: Any,
-) -> float:
+    packages: List[Dict[str, Any]] = []
 
-    return round(
-        to_float(value) / 100.0,
-        2,
-    )
+    for row in rows:
+        packages.append(
+            {
+                "id": int(row["id"]),
+                "exam_id": row["exam_id"],
+                "title": row["title"],
+                "description": row["description"],
+                "price_inr": money(row["price_paise"]) / 100.0,
+                "price_paise": int(row["price_paise"] or 0),
+                "discount_paise": int(row["discount_paise"] or 0),
+                "expiry_type": normalize(row["expiry_type"]),
+                "validity_days": row["validity_days"],
+                "fixed_expiry_date": iso_datetime(
+                    row["fixed_expiry_date"]
+                ),
+                "is_active": bool(row["is_active"]),
+                "created_at": iso_datetime(row["created_at"]),
+                "updated_at": iso_datetime(row["updated_at"]),
+                "tier": None,
+            }
+        )
+
+    return packages
 
 
-# ============================================================
-# Payment helpers
-# ============================================================
+async def fetch_legacy_packages(
+    db: AsyncSession,
+) -> List[Dict[str, Any]]:
+    """
+    Read legacy subscription_packages table.
 
-def get_payment_amount_paise(
-    payment: Any,
-) -> int:
+    Only columns that are actually required are selected.
+    """
 
-    return to_int(
-        get_value(
-            payment,
-            "amount_paise",
-            default=0,
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                exam_id,
+                title,
+                description,
+                tier,
+                price,
+                validity_days,
+                is_active,
+                created_at
+            FROM subscription_packages
+            ORDER BY created_at DESC, id DESC
+            """
         )
     )
 
+    rows = result.mappings().all()
 
-def get_payment_amount_inr(
-    payment: Any,
-) -> float:
+    packages: List[Dict[str, Any]] = []
 
-    return paise_to_rupees(
-        get_payment_amount_paise(
-            payment
+    for row in rows:
+        packages.append(
+            {
+                "id": int(row["id"]),
+                "exam_id": row["exam_id"],
+                "title": row["title"],
+                "description": row["description"],
+                "price_inr": money(row["price"]),
+                "price_paise": int(round(money(row["price"]) * 100)),
+                "discount_paise": 0,
+                "expiry_type": None,
+                "validity_days": row["validity_days"],
+                "fixed_expiry_date": None,
+                "is_active": bool(row["is_active"]),
+                "created_at": iso_datetime(row["created_at"]),
+                "updated_at": None,
+                "tier": normalize(row["tier"]),
+            }
+        )
+
+    return packages
+
+
+# ============================================================================
+# PAYMENT QUERIES
+# ============================================================================
+
+async def fetch_current_payments(
+    db: AsyncSession,
+    start_date: datetime,
+) -> List[Dict[str, Any]]:
+    """
+    Read current payments table.
+    """
+
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                user_id,
+                package_id,
+                razorpay_order_id,
+                razorpay_payment_id,
+                amount_paise,
+                status,
+                created_at,
+                updated_at
+            FROM payments
+            WHERE created_at >= :start_date
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {
+            "start_date": start_date,
+        },
+    )
+
+    rows = result.mappings().all()
+
+    payments: List[Dict[str, Any]] = []
+
+    for row in rows:
+        amount_paise = int(row["amount_paise"] or 0)
+
+        payments.append(
+            {
+                "id": int(row["id"]),
+                "user_id": int(row["user_id"]),
+                "package_id": int(row["package_id"]),
+                "order_id": row["razorpay_order_id"],
+                "payment_id": row["razorpay_payment_id"],
+                "amount_paise": amount_paise,
+                "amount_inr": round(amount_paise / 100.0, 2),
+                "status": normalize(row["status"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+
+    return payments
+
+
+async def fetch_legacy_payments(
+    db: AsyncSession,
+    start_date: datetime,
+) -> List[Dict[str, Any]]:
+    """
+    Read legacy razorpay_orders table.
+    """
+
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                user_id,
+                package_id,
+                test_id,
+                razorpay_order_id,
+                razorpay_payment_id,
+                amount_inr,
+                currency,
+                status,
+                created_at
+            FROM razorpay_orders
+            WHERE created_at >= :start_date
+              AND package_id IS NOT NULL
+            ORDER BY created_at DESC, id DESC
+            """
+        ),
+        {
+            "start_date": start_date,
+        },
+    )
+
+    rows = result.mappings().all()
+
+    payments: List[Dict[str, Any]] = []
+
+    for row in rows:
+        amount_inr = money(row["amount_inr"])
+
+        payments.append(
+            {
+                "id": int(row["id"]),
+                "user_id": int(row["user_id"]),
+                "package_id": int(row["package_id"]),
+                "order_id": row["razorpay_order_id"],
+                "payment_id": row["razorpay_payment_id"],
+                "amount_paise": int(round(amount_inr * 100)),
+                "amount_inr": amount_inr,
+                "status": normalize(row["status"]),
+                "created_at": row["created_at"],
+                "updated_at": None,
+            }
+        )
+
+    return payments
+
+
+# ============================================================================
+# SUBSCRIPTION QUERIES
+# ============================================================================
+
+async def fetch_current_subscriptions(
+    db: AsyncSession,
+) -> List[Dict[str, Any]]:
+    """
+    Read current subscriptions table.
+    """
+
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                user_id,
+                package_id,
+                payment_id,
+                start_date,
+                expiry_date,
+                status,
+                created_at,
+                updated_at
+            FROM subscriptions
+            ORDER BY created_at DESC, id DESC
+            """
         )
     )
 
+    rows = result.mappings().all()
 
-def get_payment_status(
-    payment: Any,
-) -> str:
+    subscriptions: List[Dict[str, Any]] = []
 
-    return normalize_status(
-        get_value(
-            payment,
-            "status",
-            default="",
+    for row in rows:
+        subscriptions.append(
+            {
+                "id": int(row["id"]),
+                "user_id": int(row["user_id"]),
+                "package_id": int(row["package_id"]),
+                "payment_id": int(row["payment_id"]),
+                "start_date": row["start_date"],
+                "expiry_date": row["expiry_date"],
+                "status": normalize(row["status"]),
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+            }
+        )
+
+    return subscriptions
+
+
+async def fetch_legacy_subscriptions(
+    db: AsyncSession,
+) -> List[Dict[str, Any]]:
+    """
+    Read legacy user_subscriptions table.
+
+    IMPORTANT:
+    Do not select `tier`.
+
+    The previous implementation selected user_subscriptions.tier and
+    generated:
+
+        Unknown column 'user_subscriptions.tier'
+
+    This query intentionally uses only the columns required by the sales
+    dashboard.
+    """
+
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                user_id,
+                package_id,
+                start_date,
+                end_date,
+                is_active,
+                created_at
+            FROM user_subscriptions
+            ORDER BY created_at DESC, id DESC
+            """
         )
     )
 
+    rows = result.mappings().all()
 
-def is_successful_payment(
-    payment: Any,
-) -> bool:
+    subscriptions: List[Dict[str, Any]] = []
 
-    return (
-        get_payment_status(payment)
-        in SUCCESSFUL_PAYMENT_STATUSES
-    )
+    for row in rows:
+        subscriptions.append(
+            {
+                "id": int(row["id"]),
+                "user_id": int(row["user_id"]),
+                "package_id": int(row["package_id"]),
+                "payment_id": None,
+                "start_date": row["start_date"],
+                "expiry_date": row["end_date"],
+                "status": (
+                    "ACTIVE"
+                    if bool(row["is_active"])
+                    else "EXPIRED"
+                ),
+                "created_at": row["created_at"],
+                "updated_at": None,
+            }
+        )
+
+    return subscriptions
 
 
-# ============================================================
-# Subscription helpers
-# ============================================================
+# ============================================================================
+# USER LOOKUP
+# ============================================================================
 
-def get_subscription_status(
-    subscription: Any,
-) -> str:
+async def fetch_users(
+    db: AsyncSession,
+    user_ids: List[int],
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Fetch names/emails for users involved in package sales.
 
-    return normalize_status(
-        get_value(
-            subscription,
-            "status",
-            default="",
+    Uses only columns confirmed in the supplied users schema.
+    """
+
+    if not user_ids:
+        return {}
+
+    result = await db.execute(
+        text(
+            """
+            SELECT
+                id,
+                email,
+                full_name
+            FROM users
+            WHERE id IN :user_ids
+            """
+        ).bindparams(
+            # MySQL does not expand tuple parameters automatically through
+            # plain text() in every SQLAlchemy version.
+            # This query is replaced below by dynamically created placeholders.
         )
     )
 
+    # This function is intentionally not used directly.
+    # The actual implementation below uses a safe placeholder query.
+    return {}
 
-def is_active_subscription(
-    subscription: Any,
-    now: datetime,
-) -> bool:
 
-    status = get_subscription_status(
-        subscription
+async def fetch_users_safe(
+    db: AsyncSession,
+    user_ids: List[int],
+) -> Dict[int, Dict[str, Any]]:
+    """
+    Safe IN query for MySQL/aiomysql.
+    """
+
+    if not user_ids:
+        return {}
+
+    unique_ids = sorted(
+        {
+            int(user_id)
+            for user_id in user_ids
+            if user_id is not None
+        }
     )
 
-    if status not in ACTIVE_SUBSCRIPTION_STATUSES:
-        return False
+    if not unique_ids:
+        return {}
 
-    expiry_date = get_value(
-        subscription,
-        "expiry_date",
-        default=None,
+    placeholders = ", ".join(
+        f":user_id_{index}"
+        for index in range(len(unique_ids))
     )
 
-    if isinstance(
-        expiry_date,
-        datetime,
-    ):
-        if expiry_date < now:
-            return False
+    params = {
+        f"user_id_{index}": user_id
+        for index, user_id in enumerate(unique_ids)
+    }
 
-    return True
+    result = await db.execute(
+        text(
+            f"""
+            SELECT
+                id,
+                email,
+                full_name
+            FROM users
+            WHERE id IN ({placeholders})
+            """
+        ),
+        params,
+    )
+
+    rows = result.mappings().all()
+
+    return {
+        int(row["id"]): {
+            "id": int(row["id"]),
+            "email": row["email"],
+            "full_name": row["full_name"],
+        }
+        for row in rows
+    }
 
 
-# ============================================================
-# Dashboard
-# ============================================================
+# ============================================================================
+# DASHBOARD
+# ============================================================================
 
 @router.get("/dashboard")
-async def get_package_sales_dashboard(
+async def package_sales_dashboard(
     months: int = Query(
-        default=12,
+        default=3,
         ge=1,
-        le=36,
-        description="Number of months to include in the report.",
+        le=24,
+        description="Number of months to include in the sales report",
     ),
+    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(
-        require_admin_or_super_admin
-    ),
-) -> Dict[str, Any]:
+):
+    """
+    Package Sales Dashboard.
+
+    GET:
+        /api/v1/team/sells/dashboard
+
+    Optional:
+        ?months=3
+        ?months=6
+        ?months=12
+    """
+
+    # ----------------------------------------------------------------------
+    # AUTHORIZATION
+    # ----------------------------------------------------------------------
+
+    if not authorized_role(current_user):
+        raise HTTPException(
+            status_code=403,
+            detail="Only ADMIN and SUPER_ADMIN can access package sales.",
+        )
+
+    # ----------------------------------------------------------------------
+    # DATE RANGE
+    # ----------------------------------------------------------------------
+
+    month_starts = get_month_starts(months)
+
+    start_date = month_starts[0]
 
     now = datetime.utcnow()
 
-    start_date = now - timedelta(
-        days=months * 31
+    # ----------------------------------------------------------------------
+    # DETECT REAL DATA SOURCE
+    # ----------------------------------------------------------------------
+
+    sources = await detect_sales_source(
+        db,
+        start_date,
     )
 
-    # ========================================================
+    package_source = sources["package_source"]
+    payment_source = sources["payment_source"]
+    subscription_source = sources["subscription_source"]
+
+    # ----------------------------------------------------------------------
     # LOAD PACKAGES
-    # ========================================================
+    # ----------------------------------------------------------------------
 
-    packages_result = await db.execute(
-        select(Package)
-    )
+    if package_source == "packages":
+        packages = await fetch_current_packages(db)
+    else:
+        packages = await fetch_legacy_packages(db)
 
-    packages = list(
-        packages_result.scalars().all()
-    )
-
-    # ========================================================
+    # ----------------------------------------------------------------------
     # LOAD PAYMENTS
-    # ========================================================
+    # ----------------------------------------------------------------------
 
-    payments_result = await db.execute(
-        select(Payment)
-    )
-
-    payments = list(
-        payments_result.scalars().all()
-    )
-
-    # ========================================================
-    # LOAD SUBSCRIPTIONS
-    # ========================================================
-
-    subscriptions_result = await db.execute(
-        select(Subscription)
-    )
-
-    subscriptions = list(
-        subscriptions_result.scalars().all()
-    )
-
-    # ========================================================
-    # ACTIVE PACKAGES
-    # ========================================================
-
-    active_packages = sum(
-        1
-        for package in packages
-        if bool(
-            get_value(
-                package,
-                "is_active",
-                default=True,
-            )
+    if payment_source == "payments":
+        payments = await fetch_current_payments(
+            db,
+            start_date,
         )
+    else:
+        payments = await fetch_legacy_payments(
+            db,
+            start_date,
+        )
+
+    # ----------------------------------------------------------------------
+    # LOAD SUBSCRIPTIONS
+    # ----------------------------------------------------------------------
+
+    try:
+        if subscription_source == "subscriptions":
+            subscriptions = await fetch_current_subscriptions(db)
+        else:
+            subscriptions = await fetch_legacy_subscriptions(db)
+    except Exception:
+        # If the legacy subscription table has an unexpected old structure,
+        # do not allow it to break the entire sales dashboard.
+        subscriptions = []
+
+    # ----------------------------------------------------------------------
+    # USERS
+    # ----------------------------------------------------------------------
+
+    relevant_user_ids = list(
+        {
+            int(payment["user_id"])
+            for payment in payments
+            if payment.get("user_id") is not None
+        }
+        |
+        {
+            int(subscription["user_id"])
+            for subscription in subscriptions
+            if subscription.get("user_id") is not None
+        }
     )
 
-    # ========================================================
-    # SUCCESSFUL PAYMENTS
-    # ========================================================
+    users = await fetch_users_safe(
+        db,
+        relevant_user_ids,
+    )
+
+    # ----------------------------------------------------------------------
+    # PAYMENT FILTERS
+    # ----------------------------------------------------------------------
 
     successful_payments = [
         payment
         for payment in payments
-        if is_successful_payment(payment)
+        if normalize(payment["status"]) in CURRENT_SUCCESS_STATUSES
     ]
 
-    # ========================================================
-    # TOTAL REVENUE
-    # ========================================================
+    # ----------------------------------------------------------------------
+    # REVENUE
+    # ----------------------------------------------------------------------
 
-    total_revenue_paise = sum(
-        get_payment_amount_paise(
-            payment
-        )
-        for payment in successful_payments
+    total_revenue = round(
+        sum(
+            money(payment["amount_inr"])
+            for payment in successful_payments
+        ),
+        2,
     )
 
-    total_revenue = paise_to_rupees(
-        total_revenue_paise
+    successful_sales = len(successful_payments)
+
+    # ----------------------------------------------------------------------
+    # PACKAGE COUNTS
+    # ----------------------------------------------------------------------
+
+    total_packages = len(packages)
+
+    active_packages = sum(
+        1
+        for package in packages
+        if bool(package["is_active"])
     )
 
-    total_sales = len(
-        successful_payments
-    )
+    # ----------------------------------------------------------------------
+    # ACTIVE STUDENTS
+    # ----------------------------------------------------------------------
 
-    # ========================================================
-    # ACTIVE SUBSCRIPTIONS
-    # ========================================================
-
-    active_subscriptions = [
-        subscription
+    active_subscription_user_ids = {
+        int(subscription["user_id"])
         for subscription in subscriptions
-        if is_active_subscription(
-            subscription,
-            now,
+        if normalize(subscription["status"]) == ACTIVE_SUBSCRIPTION_STATUS
+        and (
+            subscription["expiry_date"] is None
+            or subscription["expiry_date"] >= now
+        )
+    }
+
+    active_students = len(active_subscription_user_ids)
+
+    # ----------------------------------------------------------------------
+    # FALLBACK ACTIVE STUDENTS
+    #
+    # If the current payment flow has successful payments but subscriptions
+    # have not been written yet, show the actual paying users rather than
+    # incorrectly showing zero.
+    # ----------------------------------------------------------------------
+
+    if active_students == 0 and successful_payments:
+        active_students = len(
+            {
+                int(payment["user_id"])
+                for payment in successful_payments
+            }
+        )
+
+    # ----------------------------------------------------------------------
+    # PAYMENT STATUS DISTRIBUTION
+    # ----------------------------------------------------------------------
+
+    status_counts: Dict[str, int] = defaultdict(int)
+
+    for payment in payments:
+        status = normalize(payment["status"]) or "UNKNOWN"
+        status_counts[status] += 1
+
+    payment_status = [
+        {
+            "status": status,
+            "count": count,
+        }
+        for status, count in sorted(
+            status_counts.items(),
+            key=lambda item: (-item[1], item[0]),
         )
     ]
 
-    # ========================================================
-    # UNIQUE ACTIVE STUDENTS
-    # ========================================================
+    # ----------------------------------------------------------------------
+    # PACKAGE MAP
+    # ----------------------------------------------------------------------
 
-    active_student_ids = set()
+    package_map = {
+        int(package["id"]): package
+        for package in packages
+    }
 
-    for subscription in active_subscriptions:
+    # ----------------------------------------------------------------------
+    # PACKAGE SALES AGGREGATION
+    # ----------------------------------------------------------------------
 
-        user_id = get_value(
-            subscription,
-            "user_id",
-            default=None,
+    package_sales_count: Dict[int, int] = defaultdict(int)
+    package_revenue: Dict[int, float] = defaultdict(float)
+
+    for payment in successful_payments:
+        package_id = int(payment["package_id"])
+
+        package_sales_count[package_id] += 1
+        package_revenue[package_id] += money(
+            payment["amount_inr"]
         )
 
-        if user_id is not None:
-            active_student_ids.add(
-                str(user_id)
+    # ----------------------------------------------------------------------
+    # SUBSCRIPTION AGGREGATION
+    # ----------------------------------------------------------------------
+
+    package_subscription_count: Dict[int, int] = defaultdict(int)
+    package_active_students: Dict[int, set] = defaultdict(set)
+    package_expired_students: Dict[int, set] = defaultdict(set)
+
+    for subscription in subscriptions:
+        package_id = int(subscription["package_id"])
+        user_id = int(subscription["user_id"])
+
+        package_subscription_count[package_id] += 1
+
+        status = normalize(subscription["status"])
+        expiry_date = subscription["expiry_date"]
+
+        if (
+            status == "ACTIVE"
+            and (
+                expiry_date is None
+                or expiry_date >= now
             )
-
-    # ========================================================
-    # PACKAGE PERFORMANCE
-    # ========================================================
-
-    package_rows: List[
-        Dict[str, Any]
-    ] = []
-
-    for package in packages:
-
-        package_id = get_id(
-            package
-        )
-
-        package_id_string = (
-            str(package_id)
-            if package_id is not None
-            else None
-        )
-
-        # ----------------------------------------------------
-        # Successful payments for this package
-        # ----------------------------------------------------
-
-        package_payments = []
-
-        for payment in successful_payments:
-
-            payment_package_id = get_value(
-                payment,
-                "package_id",
-                default=None,
+        ):
+            package_active_students[package_id].add(
+                user_id
             )
-
-            if (
-                payment_package_id is not None
-                and package_id_string is not None
-                and str(payment_package_id)
-                == package_id_string
-            ):
-                package_payments.append(
-                    payment
-                )
-
-        sales_count = len(
-            package_payments
-        )
-
-        package_revenue_paise = sum(
-            get_payment_amount_paise(
-                payment
-            )
-            for payment in package_payments
-        )
-
-        package_revenue = paise_to_rupees(
-            package_revenue_paise
-        )
-
-        # ----------------------------------------------------
-        # Subscriptions for this package
-        # ----------------------------------------------------
-
-        package_subscriptions = []
-
-        for subscription in subscriptions:
-
-            subscription_package_id = (
-                get_value(
-                    subscription,
-                    "package_id",
-                    default=None,
-                )
-            )
-
-            if (
-                subscription_package_id is not None
-                and package_id_string is not None
-                and str(
-                    subscription_package_id
-                )
-                == package_id_string
-            ):
-                package_subscriptions.append(
-                    subscription
-                )
-
-        # ----------------------------------------------------
-        # Student counts
-        # ----------------------------------------------------
-
-        total_student_ids = set()
-
-        active_student_ids_for_package = set()
-
-        expired_student_ids_for_package = set()
-
-        for subscription in package_subscriptions:
-
-            user_id = get_value(
-                subscription,
-                "user_id",
-                default=None,
-            )
-
-            if user_id is None:
-                continue
-
-            user_id_string = str(
+        else:
+            package_expired_students[package_id].add(
                 user_id
             )
 
-            total_student_ids.add(
-                user_id_string
-            )
+    # ----------------------------------------------------------------------
+    # PACKAGE PERFORMANCE
+    # ----------------------------------------------------------------------
 
-            if is_active_subscription(
-                subscription,
-                now,
-            ):
+    package_performance: List[Dict[str, Any]] = []
 
-                active_student_ids_for_package.add(
-                    user_id_string
-                )
+    for package in packages:
+        package_id = int(package["id"])
 
-            else:
-
-                expired_student_ids_for_package.add(
-                    user_id_string
-                )
-
-        # ----------------------------------------------------
-        # Package result
-        # ----------------------------------------------------
-
-        package_rows.append(
+        package_performance.append(
             {
                 "id": package_id,
-
-                "title": get_package_title(
-                    package
+                "package_id": package_id,
+                "title": package["title"],
+                "description": package["description"],
+                "exam_id": package["exam_id"],
+                "tier": package.get("tier"),
+                "expiry_type": package.get("expiry_type"),
+                "price_inr": money(package["price_inr"]),
+                "validity_days": package["validity_days"],
+                "is_active": bool(package["is_active"]),
+                "sales": package_sales_count.get(
+                    package_id,
+                    0,
                 ),
-
-                "description": get_value(
-                    package,
-                    "description",
-                    default=None,
+                "successful_sales": package_sales_count.get(
+                    package_id,
+                    0,
                 ),
-
-                "tier": str(
-                    get_value(
-                        package,
-                        "expiry_type",
-                        default="",
-                    )
+                "revenue": round(
+                    package_revenue.get(
+                        package_id,
+                        0.0,
+                    ),
+                    2,
                 ),
-
-                "price": paise_to_rupees(
-                    get_package_price_paise(
-                        package
-                    )
-                ),
-
-                "price_paise": get_package_price_paise(
-                    package
-                ),
-
-                "discount_paise": to_int(
-                    get_value(
-                        package,
-                        "discount_paise",
-                        default=0,
-                    )
-                ),
-
-                "validity_days": get_value(
-                    package,
-                    "validity_days",
-                    default=None,
-                ),
-
-                "expiry_type": str(
-                    get_value(
-                        package,
-                        "expiry_type",
-                        default="DURATION",
-                    )
-                ),
-
-                "is_active": bool(
-                    get_value(
-                        package,
-                        "is_active",
-                        default=True,
-                    )
-                ),
-
-                "created_at": serialize_datetime(
-                    get_value(
-                        package,
-                        "created_at",
-                        default=None,
-                    )
-                ),
-
-                "sales_count": sales_count,
-
-                "revenue": package_revenue,
-
-                "revenue_paise": package_revenue_paise,
-
                 "active_students": len(
-                    active_student_ids_for_package
-                ),
-
-                "total_students": len(
-                    total_student_ids
-                ),
-
-                "expired_students": len(
-                    expired_student_ids_for_package
-                ),
-            }
-        )
-
-    # ========================================================
-    # MONTHLY REVENUE
-    # ========================================================
-
-    monthly_revenue: List[
-        Dict[str, Any]
-    ] = []
-
-    cursor = datetime(
-        start_date.year,
-        start_date.month,
-        1,
-    )
-
-    while cursor <= now:
-
-        if cursor.month == 12:
-
-            next_month = datetime(
-                cursor.year + 1,
-                1,
-                1,
-            )
-
-        else:
-
-            next_month = datetime(
-                cursor.year,
-                cursor.month + 1,
-                1,
-            )
-
-        month_revenue_paise = 0
-
-        month_sales = 0
-
-        for payment in successful_payments:
-
-            created_at = get_value(
-                payment,
-                "created_at",
-                default=None,
-            )
-
-            if not isinstance(
-                created_at,
-                datetime,
-            ):
-                continue
-
-            if (
-                created_at >= cursor
-                and created_at < next_month
-            ):
-
-                month_sales += 1
-
-                month_revenue_paise += (
-                    get_payment_amount_paise(
-                        payment
+                    package_active_students.get(
+                        package_id,
+                        set(),
                     )
-                )
-
-        monthly_revenue.append(
-            {
-                "month": cursor.strftime(
-                    "%Y-%m"
                 ),
-
-                "label": cursor.strftime(
-                    "%b %Y"
+                "total_students": len(
+                    {
+                        int(subscription["user_id"])
+                        for subscription in subscriptions
+                        if int(subscription["package_id"])
+                        == package_id
+                    }
                 ),
-
-                "sales": month_sales,
-
-                "revenue": paise_to_rupees(
-                    month_revenue_paise
+                "expired_students": len(
+                    package_expired_students.get(
+                        package_id,
+                        set(),
+                    )
                 ),
-
-                "revenue_paise": month_revenue_paise,
+                "subscription_count": package_subscription_count.get(
+                    package_id,
+                    0,
+                ),
             }
         )
 
-        cursor = next_month
+    # ----------------------------------------------------------------------
+    # SORT PACKAGE PERFORMANCE
+    # ----------------------------------------------------------------------
 
-    # ========================================================
-    # PAYMENT STATUS SUMMARY
-    # ========================================================
-
-    payment_status_map: Dict[
-        str,
-        Dict[str, Any],
-    ] = {}
-
-    for payment in payments:
-
-        status = get_payment_status(
-            payment
+    package_performance.sort(
+        key=lambda item: (
+            -float(item["revenue"]),
+            -int(item["sales"]),
+            str(item["title"]).lower(),
         )
-
-        if not status:
-            status = "UNKNOWN"
-
-        if status not in payment_status_map:
-
-            payment_status_map[
-                status
-            ] = {
-                "status": status,
-                "count": 0,
-                "amount": 0.0,
-                "amount_paise": 0,
-            }
-
-        amount_paise = (
-            get_payment_amount_paise(
-                payment
-            )
-        )
-
-        payment_status_map[
-            status
-        ]["count"] += 1
-
-        payment_status_map[
-            status
-        ]["amount_paise"] += (
-            amount_paise
-        )
-
-        payment_status_map[
-            status
-        ]["amount"] = paise_to_rupees(
-            payment_status_map[
-                status
-            ]["amount_paise"]
-        )
-
-    payment_status = list(
-        payment_status_map.values()
     )
 
-    # ========================================================
-    # LOAD USERS
-    # ========================================================
+    # ----------------------------------------------------------------------
+    # MONTHLY REVENUE
+    # ----------------------------------------------------------------------
 
-    users_result = await db.execute(
-        select(User)
-    )
+    monthly_revenue_map: Dict[str, Dict[str, Any]] = {}
 
-    users = list(
-        users_result.scalars().all()
-    )
+    for start in month_starts:
+        key = month_label(
+            start.year,
+            start.month,
+        )
 
-    users_by_id = {
-        str(get_id(user)): user
-        for user in users
-        if get_id(user) is not None
-    }
+        monthly_revenue_map[key] = {
+            "month": key,
+            "label": start.strftime("%b"),
+            "revenue": 0.0,
+            "sales": 0,
+        }
 
-    # ========================================================
-    # PACKAGES MAP
-    # ========================================================
+    for payment in successful_payments:
+        created_at = payment["created_at"]
 
-    packages_by_id = {
-        str(get_id(package)): package
-        for package in packages
-        if get_id(package) is not None
-    }
+        if not created_at:
+            continue
 
-    # ========================================================
+        if not isinstance(created_at, datetime):
+            continue
+
+        key = month_label(
+            created_at.year,
+            created_at.month,
+        )
+
+        if key not in monthly_revenue_map:
+            continue
+
+        monthly_revenue_map[key]["revenue"] += money(
+            payment["amount_inr"]
+        )
+
+        monthly_revenue_map[key]["sales"] += 1
+
+    monthly_revenue = []
+
+    for item in monthly_revenue_map.values():
+        item["revenue"] = round(
+            float(item["revenue"]),
+            2,
+        )
+
+        monthly_revenue.append(item)
+
+    # ----------------------------------------------------------------------
     # RECENT SALES
-    # ========================================================
+    # ----------------------------------------------------------------------
 
-    sorted_payments = sorted(
-        payments,
-        key=lambda payment: (
-            get_value(
-                payment,
-                "created_at",
-                default=datetime.min,
-            )
-            if isinstance(
-                get_value(
-                    payment,
-                    "created_at",
-                    default=None,
-                ),
-                datetime,
-            )
-            else datetime.min
-        ),
-        reverse=True,
-    )
+    recent_sales: List[Dict[str, Any]] = []
 
-    recent_sales = []
-
-    for payment in sorted_payments[:25]:
-
-        user_id = get_value(
-            payment,
-            "user_id",
-            default=None,
+    for payment in payments[:20]:
+        package = package_map.get(
+            int(payment["package_id"])
         )
 
-        package_id = get_value(
-            payment,
-            "package_id",
-            default=None,
-        )
-
-        user = (
-            users_by_id.get(
-                str(user_id)
-            )
-            if user_id is not None
-            else None
-        )
-
-        package = (
-            packages_by_id.get(
-                str(package_id)
-            )
-            if package_id is not None
-            else None
+        user = users.get(
+            int(payment["user_id"])
         )
 
         recent_sales.append(
             {
-                "id": get_id(
-                    payment
-                ),
-
-                "user_id": user_id,
-
+                "id": payment["id"],
+                "user_id": payment["user_id"],
                 "student_name": (
-                    str(
-                        get_value(
-                            user,
-                            "full_name",
-                            default="Student",
-                        )
-                    )
-                    if user
-                    else "Student"
-                ),
-
-                "student_email": (
-                    get_value(
-                        user,
-                        "email",
-                        default=None,
-                    )
+                    user["full_name"]
                     if user
                     else None
                 ),
-
-                "package_id": package_id,
-
+                "student_email": (
+                    user["email"]
+                    if user
+                    else None
+                ),
+                "package_id": payment["package_id"],
                 "package_title": (
-                    get_package_title(
-                        package
-                    )
+                    package["title"]
                     if package
-                    else "Package"
+                    else f"Package #{payment['package_id']}"
                 ),
-
-                "amount": get_payment_amount_inr(
-                    payment
+                "amount_inr": money(
+                    payment["amount_inr"]
                 ),
-
-                "amount_paise": (
-                    get_payment_amount_paise(
-                        payment
-                    )
+                "status": normalize(
+                    payment["status"]
                 ),
-
-                "currency": str(
-                    get_value(
-                        payment,
-                        "currency",
-                        default="INR",
-                    )
-                ),
-
-                "status": str(
-                    get_value(
-                        payment,
-                        "status",
-                        default="UNKNOWN",
-                    )
-                ),
-
-                "razorpay_order_id": get_value(
-                    payment,
-                    "razorpay_order_id",
-                    default=None,
-                ),
-
-                "razorpay_payment_id": get_value(
-                    payment,
-                    "razorpay_payment_id",
-                    default=None,
-                ),
-
-                "created_at": serialize_datetime(
-                    get_value(
-                        payment,
-                        "created_at",
-                        default=None,
-                    )
+                "order_id": payment["order_id"],
+                "payment_id": payment["payment_id"],
+                "created_at": iso_datetime(
+                    payment["created_at"]
                 ),
             }
         )
 
-    # ========================================================
-    # TOP PACKAGE BY REVENUE
-    # ========================================================
+    # ----------------------------------------------------------------------
+    # ENROLLMENT REPORT
+    # ----------------------------------------------------------------------
+
+    enrollment_report: List[Dict[str, Any]] = []
+
+    for package in packages:
+        package_id = int(package["id"])
+
+        student_ids = {
+            int(subscription["user_id"])
+            for subscription in subscriptions
+            if int(subscription["package_id"]) == package_id
+        }
+
+        enrollment_report.append(
+            {
+                "package_id": package_id,
+                "package_title": package["title"],
+                "students": len(student_ids),
+                "total_enrollments": package_subscription_count.get(
+                    package_id,
+                    0,
+                ),
+                "active_students": len(
+                    package_active_students.get(
+                        package_id,
+                        set(),
+                    )
+                ),
+                "expired_students": len(
+                    package_expired_students.get(
+                        package_id,
+                        set(),
+                    )
+                ),
+                "sales": package_sales_count.get(
+                    package_id,
+                    0,
+                ),
+                "revenue": round(
+                    package_revenue.get(
+                        package_id,
+                        0.0,
+                    ),
+                    2,
+                ),
+            }
+        )
+
+    enrollment_report.sort(
+        key=lambda item: (
+            -int(item["students"]),
+            -float(item["revenue"]),
+            str(item["package_title"]).lower(),
+        )
+    )
+
+    # ----------------------------------------------------------------------
+    # TOP PACKAGE
+    # ----------------------------------------------------------------------
 
     top_package = None
 
-    if package_rows:
+    if package_performance:
+        top = package_performance[0]
 
-        top_package = max(
-            package_rows,
-            key=lambda item: item[
-                "revenue_paise"
-            ],
-        )
+        if (
+            top["sales"] > 0
+            or top["revenue"] > 0
+            or top["active_students"] > 0
+        ):
+            top_package = {
+                "id": top["id"],
+                "title": top["title"],
+                "sales": top["sales"],
+                "revenue": top["revenue"],
+                "active_students": top["active_students"],
+            }
 
-    # ========================================================
-    # TOP PACKAGE BY ENROLLMENTS
-    # ========================================================
+    # ----------------------------------------------------------------------
+    # PROFIT
+    #
+    # There is no cost/expense column in the supplied package/payment
+    # schema, therefore we intentionally do NOT fabricate a profit number.
+    # ----------------------------------------------------------------------
 
-    top_package_by_students = None
+    profit = None
 
-    if package_rows:
-
-        top_package_by_students = max(
-            package_rows,
-            key=lambda item: item[
-                "total_students"
-            ],
-        )
-
-    # ========================================================
-    # PACKAGE SUMMARY
-    # ========================================================
-
-    total_package_students = sum(
-        item["total_students"]
-        for item in package_rows
-    )
-
-    total_active_package_students = sum(
-        item["active_students"]
-        for item in package_rows
-    )
-
-    # ========================================================
+    # ----------------------------------------------------------------------
     # RESPONSE
-    # ========================================================
+    # ----------------------------------------------------------------------
 
     return {
-        "generated_at": now.isoformat(),
-
-        "report_period": {
+        "period": {
             "months": months,
             "start_date": start_date.isoformat(),
             "end_date": now.isoformat(),
         },
 
-        "overview": {
-            "active_packages": active_packages,
-
-            "total_packages": len(
-                packages
-            ),
-
-            "total_sales": total_sales,
-
+        "summary": {
             "total_revenue": total_revenue,
-
-            "total_revenue_paise": total_revenue_paise,
-
-            "gross_revenue": total_revenue,
-
-            "active_students": len(
-                active_subscriptions
-            ),
-
-            "unique_active_students": len(
-                active_student_ids
-            ),
-
-            "total_package_students": (
-                total_package_students
-            ),
-
-            "total_active_package_students": (
-                total_active_package_students
-            ),
-
-            # There is currently no expense/cost field
-            # in the models supplied by you, so we do not
-            # fabricate a profit value.
-            "profit": None,
+            "revenue": total_revenue,
+            "successful_sales": successful_sales,
+            "sales": successful_sales,
+            "active_students": active_students,
+            "active_packages": active_packages,
+            "total_packages": total_packages,
+            "all_packages": total_packages,
+            "profit": profit,
         },
 
-        "top_package": top_package,
-
-        "top_package_by_students": (
-            top_package_by_students
-        ),
-
-        "packages": package_rows,
+        # Kept at the top level as well so the existing frontend can use
+        # either dashboard.summary.* or dashboard.*.
+        "total_revenue": total_revenue,
+        "revenue": total_revenue,
+        "successful_sales": successful_sales,
+        "active_students": active_students,
+        "active_packages": active_packages,
+        "total_packages": total_packages,
+        "profit": profit,
 
         "monthly_revenue": monthly_revenue,
 
+        "revenue_trend": monthly_revenue,
+
         "payment_status": payment_status,
 
+        "package_performance": package_performance,
+
+        "enrollment_report": enrollment_report,
+
         "recent_sales": recent_sales,
+
+        "top_package": top_package,
+
+        "sources": {
+            "packages": package_source,
+            "payments": payment_source,
+            "subscriptions": subscription_source,
+        },
     }
