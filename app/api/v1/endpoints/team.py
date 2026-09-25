@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -263,6 +263,16 @@ async def create_question(
     )
 
     db.add(question)
+    await db.flush()
+
+    # The database has a created_by column, but the SQLAlchemy Question model
+    # does not expose it. Write ownership with SQL so we do not change the
+    # existing ORM model/schema.
+    await db.execute(
+        text("UPDATE questions SET created_by = :uid WHERE id = :qid"),
+        {"uid": current_user.id, "qid": question.id},
+    )
+
     await db.commit()
     await db.refresh(question)
 
@@ -377,15 +387,27 @@ async def assemble_test(
     db.add(test)
     await db.flush()
 
+    # The database has tests.created_by, but the ORM model does not expose it.
+    await db.execute(
+        text("UPDATE tests SET created_by = :uid WHERE id = :tid"),
+        {"uid": current_user.id, "tid": test.id},
+    )
+
     for order, (question_id, marks, negative_marks) in enumerate(prepared, start=1):
-        db.add(
-            TestQuestion(
-                test_id=test.id,
-                question_id=question_id,
-                order=order,
-                marks=marks,
-                negative_marks=negative_marks,
-            )
+        test_question = TestQuestion(
+            test_id=test.id,
+            question_id=question_id,
+            order=order,
+            marks=marks,
+            negative_marks=negative_marks,
+        )
+        db.add(test_question)
+        await db.flush()
+        # Attribute this paper addition to the authenticated user without
+        # adding an unsupported field to the ORM model.
+        await db.execute(
+            text("UPDATE test_questions SET added_by = :uid WHERE id = :tqid"),
+            {"uid": current_user.id, "tqid": test_question.id},
         )
 
     package_ids = payload.get("package_ids") or []
@@ -521,6 +543,11 @@ async def create_subject(
     )
 
     db.add(subject)
+    await db.flush()
+    await db.execute(
+        text("UPDATE subjects SET created_by = :uid WHERE id = :sid"),
+        {"uid": current_user.id, "sid": subject.id},
+    )
 
     await db.commit()
     await db.refresh(subject)
@@ -566,6 +593,11 @@ async def create_chapter(
     )
 
     db.add(chapter)
+    await db.flush()
+    await db.execute(
+        text("UPDATE chapters SET created_by = :uid WHERE id = :cid"),
+        {"uid": current_user.id, "cid": chapter.id},
+    )
 
     await db.commit()
     await db.refresh(chapter)
@@ -611,6 +643,11 @@ async def create_topic(
     )
 
     db.add(topic)
+    await db.flush()
+    await db.execute(
+        text("UPDATE topics SET created_by = :uid WHERE id = :tid"),
+        {"uid": current_user.id, "tid": topic.id},
+    )
 
     await db.commit()
     await db.refresh(topic)
