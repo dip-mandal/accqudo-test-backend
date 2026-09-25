@@ -14,9 +14,10 @@ LEGACY:
         -> razorpay_orders
         -> user_subscriptions
 
-The dashboard automatically selects the sales source that actually contains
-successful package sales, preventing the dashboard from incorrectly showing
-zero when the data exists in the legacy tables.
+The dashboard automatically selects the package/payment source that contains
+the real sales data. It also falls back to successful paying users when the
+payment exists but a subscription row has not yet been created, so enrollment
+metrics do not incorrectly show zero.
 
 Route:
     GET /api/v1/team/sells/dashboard
@@ -104,6 +105,44 @@ def iso_datetime(value: Any) -> Optional[str]:
         return value.isoformat()
 
     return str(value)
+
+
+def to_datetime(value: Any) -> Optional[datetime]:
+    """
+    Safely normalize a database datetime value.
+
+    MySQL/aiomysql normally returns datetime objects, but this helper also
+    accepts ISO-like strings so monthly aggregation cannot silently lose
+    revenue when a driver/version returns text.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, datetime):
+        return value
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    try:
+        return datetime.fromisoformat(
+            raw.replace("Z", "+00:00")
+        ).replace(tzinfo=None)
+    except (TypeError, ValueError):
+        pass
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+    ):
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+
+    return None
 
 
 def month_label(year: int, month: int) -> str:
@@ -666,41 +705,6 @@ async def fetch_users(
     user_ids: List[int],
 ) -> Dict[int, Dict[str, Any]]:
     """
-    Fetch names/emails for users involved in package sales.
-
-    Uses only columns confirmed in the supplied users schema.
-    """
-
-    if not user_ids:
-        return {}
-
-    result = await db.execute(
-        text(
-            """
-            SELECT
-                id,
-                email,
-                full_name
-            FROM users
-            WHERE id IN :user_ids
-            """
-        ).bindparams(
-            # MySQL does not expand tuple parameters automatically through
-            # plain text() in every SQLAlchemy version.
-            # This query is replaced below by dynamically created placeholders.
-        )
-    )
-
-    # This function is intentionally not used directly.
-    # The actual implementation below uses a safe placeholder query.
-    return {}
-
-
-async def fetch_users_safe(
-    db: AsyncSession,
-    user_ids: List[int],
-) -> Dict[int, Dict[str, Any]]:
-    """
     Safe IN query for MySQL/aiomysql.
     """
 
@@ -870,7 +874,7 @@ async def package_sales_dashboard(
         }
     )
 
-    users = await fetch_users_safe(
+    users = await fetch_users(
         db,
         relevant_user_ids,
     )
@@ -920,28 +924,34 @@ async def package_sales_dashboard(
         for subscription in subscriptions
         if normalize(subscription["status"]) == ACTIVE_SUBSCRIPTION_STATUS
         and (
-            subscription["expiry_date"] is None
-            or subscription["expiry_date"] >= now
+            to_datetime(subscription.get("expiry_date")) is None
+            or to_datetime(subscription.get("expiry_date")) >= now
         )
     }
 
     active_students = len(active_subscription_user_ids)
 
     # ----------------------------------------------------------------------
-    # FALLBACK ACTIVE STUDENTS
+    # PAYMENT-BASED FALLBACK
     #
-    # If the current payment flow has successful payments but subscriptions
-    # have not been written yet, show the actual paying users rather than
-    # incorrectly showing zero.
+    # Some successful Razorpay payments can exist before the subscription
+    # record is created. In that situation the old dashboard showed 0
+    # students even though real students had paid.
+    #
+    # If there are no subscription records at all, use distinct successful
+    # paying users as the temporary enrollment/active-student source.
     # ----------------------------------------------------------------------
 
-    if active_students == 0 and successful_payments:
-        active_students = len(
-            {
-                int(payment["user_id"])
-                for payment in successful_payments
-            }
-        )
+    has_subscription_records = bool(subscriptions)
+
+    successful_payment_user_ids = {
+        int(payment["user_id"])
+        for payment in successful_payments
+        if payment.get("user_id") is not None
+    }
+
+    if not has_subscription_records and successful_payment_user_ids:
+        active_students = len(successful_payment_user_ids)
 
     # ----------------------------------------------------------------------
     # PAYMENT STATUS DISTRIBUTION
@@ -1003,7 +1013,7 @@ async def package_sales_dashboard(
         package_subscription_count[package_id] += 1
 
         status = normalize(subscription["status"])
-        expiry_date = subscription["expiry_date"]
+        expiry_date = to_datetime(subscription.get("expiry_date"))
 
         if (
             status == "ACTIVE"
@@ -1019,6 +1029,27 @@ async def package_sales_dashboard(
             package_expired_students[package_id].add(
                 user_id
             )
+
+    # ----------------------------------------------------------------------
+    # PAYMENT-BASED PACKAGE ENROLLMENT FALLBACK
+    #
+    # If there are no subscription rows, derive package students from the
+    # successful package payments. Once real subscription rows exist, those
+    # remain authoritative for active/expired enrollment counts.
+    # ----------------------------------------------------------------------
+
+    if not has_subscription_records:
+        package_payment_users: Dict[int, set] = defaultdict(set)
+
+        for payment in successful_payments:
+            package_id = int(payment["package_id"])
+            user_id = int(payment["user_id"])
+
+            package_payment_users[package_id].add(user_id)
+
+        for package_id, user_ids in package_payment_users.items():
+            package_active_students[package_id].update(user_ids)
+            package_subscription_count[package_id] = len(user_ids)
 
     # ----------------------------------------------------------------------
     # PACKAGE PERFORMANCE
@@ -1062,13 +1093,24 @@ async def package_sales_dashboard(
                         set(),
                     )
                 ),
-                "total_students": len(
-                    {
-                        int(subscription["user_id"])
-                        for subscription in subscriptions
-                        if int(subscription["package_id"])
-                        == package_id
-                    }
+                "total_students": (
+                    len(
+                        {
+                            int(subscription["user_id"])
+                            for subscription in subscriptions
+                            if int(subscription["package_id"])
+                            == package_id
+                        }
+                    )
+                    if has_subscription_records
+                    else len(
+                        {
+                            int(payment["user_id"])
+                            for payment in successful_payments
+                            if int(payment["package_id"])
+                            == package_id
+                        }
+                    )
                 ),
                 "expired_students": len(
                     package_expired_students.get(
@@ -1115,12 +1157,9 @@ async def package_sales_dashboard(
         }
 
     for payment in successful_payments:
-        created_at = payment["created_at"]
+        created_at = to_datetime(payment.get("created_at"))
 
-        if not created_at:
-            continue
-
-        if not isinstance(created_at, datetime):
+        if created_at is None:
             continue
 
         key = month_label(
@@ -1205,11 +1244,18 @@ async def package_sales_dashboard(
     for package in packages:
         package_id = int(package["id"])
 
-        student_ids = {
-            int(subscription["user_id"])
-            for subscription in subscriptions
-            if int(subscription["package_id"]) == package_id
-        }
+        if has_subscription_records:
+            student_ids = {
+                int(subscription["user_id"])
+                for subscription in subscriptions
+                if int(subscription["package_id"]) == package_id
+            }
+        else:
+            student_ids = {
+                int(payment["user_id"])
+                for payment in successful_payments
+                if int(payment["package_id"]) == package_id
+            }
 
         enrollment_report.append(
             {
