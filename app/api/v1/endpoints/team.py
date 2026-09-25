@@ -207,7 +207,7 @@ async def search_questions(
 async def create_question(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_team_or_admin),
+    current_user: User = Depends(require_team_or_admin),
 ):
     """Create a question in the team question bank."""
     topic_id = payload.get("topic_id")
@@ -253,6 +253,7 @@ async def create_question(
 
     question = Question(
         topic_id=topic_id,
+        created_by=current_user.id,
         question_type=question_type,
         question_text=question_text,
         options=payload.get("options"),
@@ -277,7 +278,7 @@ async def create_question(
 async def assemble_test(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_team_or_admin),
+    current_user: User = Depends(require_team_or_admin),
 ):
     """Create a test and persist the exact marks configured in the paper canvas."""
     title = str(payload.get("title") or "").strip()
@@ -369,6 +370,7 @@ async def assemble_test(
 
     test = Test(
         exam_id=exam_id,
+        created_by=current_user.id,
         title=title,
         duration_minutes=duration_minutes,
         total_marks=total_marks,
@@ -381,6 +383,7 @@ async def assemble_test(
         db.add(
             TestQuestion(
                 test_id=test.id,
+                added_by=current_user.id,
                 question_id=question_id,
                 order=order,
                 marks=marks,
@@ -448,7 +451,7 @@ async def assemble_test(
 async def create_exam(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_team_or_admin),
+    current_user: User = Depends(require_team_or_admin),
 ):
     """
     Create an exam.
@@ -471,6 +474,7 @@ async def create_exam(
 
     exam = Exam(
         title=title,
+        created_by=current_user.id,
         code=code,
     )
 
@@ -494,7 +498,7 @@ async def create_exam(
 async def create_subject(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_team_or_admin),
+    current_user: User = Depends(require_team_or_admin),
 ):
     """
     Create a subject under an exam.
@@ -517,6 +521,7 @@ async def create_subject(
 
     subject = Subject(
         exam_id=exam_id,
+        created_by=current_user.id,
         name=name,
     )
 
@@ -539,7 +544,7 @@ async def create_subject(
 async def create_chapter(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_team_or_admin),
+    current_user: User = Depends(require_team_or_admin),
 ):
     """
     Create a chapter under a subject.
@@ -562,6 +567,7 @@ async def create_chapter(
 
     chapter = Chapter(
         subject_id=subject_id,
+        created_by=current_user.id,
         name=name,
     )
 
@@ -584,7 +590,7 @@ async def create_chapter(
 async def create_topic(
     payload: dict,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_team_or_admin),
+    current_user: User = Depends(require_team_or_admin),
 ):
     """
     Create a topic under a chapter.
@@ -607,6 +613,7 @@ async def create_topic(
 
     topic = Topic(
         chapter_id=chapter_id,
+        created_by=current_user.id,
         name=name,
     )
 

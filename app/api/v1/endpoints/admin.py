@@ -744,7 +744,11 @@ async def create_exam(
     current_user: User = Depends(get_current_user),
 ):
     check_admin(current_user)
-    exam = Exam(title=payload.title, code=payload.code)
+    exam = Exam(
+        title=payload.title,
+        code=payload.code,
+        created_by=current_user.id,
+    )
     db.add(exam)
     await db.commit()
     await db.refresh(exam)
@@ -758,7 +762,11 @@ async def create_subject(
     current_user: User = Depends(get_current_user),
 ):
     check_admin(current_user)
-    subject = Subject(exam_id=payload.exam_id, name=payload.name)
+    subject = Subject(
+        exam_id=payload.exam_id,
+        name=payload.name,
+        created_by=current_user.id,
+    )
     db.add(subject)
     await db.commit()
     await db.refresh(subject)
@@ -772,7 +780,11 @@ async def create_chapter(
     current_user: User = Depends(get_current_user),
 ):
     check_admin(current_user)
-    chapter = Chapter(subject_id=payload.subject_id, name=payload.name)
+    chapter = Chapter(
+        subject_id=payload.subject_id,
+        name=payload.name,
+        created_by=current_user.id,
+    )
     db.add(chapter)
     await db.commit()
     await db.refresh(chapter)
@@ -786,7 +798,11 @@ async def create_topic(
     current_user: User = Depends(get_current_user),
 ):
     check_admin(current_user)
-    topic = Topic(chapter_id=payload.chapter_id, name=payload.name)
+    topic = Topic(
+        chapter_id=payload.chapter_id,
+        name=payload.name,
+        created_by=current_user.id,
+    )
     db.add(topic)
     await db.commit()
     await db.refresh(topic)
@@ -816,6 +832,7 @@ async def create_question(
 
     question = Question(
         topic_id=payload.topic_id,
+        created_by=current_user.id,
         question_type=payload.question_type,
         question_text=payload.question_text,
         options=payload.options,
@@ -924,6 +941,7 @@ async def assemble_test(
 
     new_test = Test(
         exam_id=payload.exam_id,
+        created_by=current_user.id,
         title=payload.title,
         duration_minutes=payload.duration_minutes,
         total_marks=total_marks,
@@ -938,6 +956,7 @@ async def assemble_test(
             q_obj = q_map[q_id]
             mapping = TestQuestion(
                 test_id=new_test.id,
+                added_by=current_user.id,
                 question_id=q_id,
                 order=idx,
                 marks=float(q_obj.default_marks or 1.0),
@@ -1039,6 +1058,7 @@ async def create_package(
     check_admin(current_user)
     new_pkg = SubscriptionPackage(
         exam_id=payload.exam_id,
+        created_by=current_user.id,
         title=payload.title,
         description=payload.description,
         price_inr=payload.price_inr,
@@ -1208,6 +1228,7 @@ async def bulk_upload_questions(
 
             question = Question(
                 topic_id=int(row["topic_id"]),
+                created_by=current_user.id,
                 question_type=q_type_str,
                 question_text=q_text_dict,
                 options=parsed_options,
