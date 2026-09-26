@@ -268,9 +268,11 @@ async def contribution_dashboard(
 
     for r in package_topic_rows:
         pid = int(r["package_id"])
-        package = package_nodes.setdefault(pid, {
-            "id": pid, "title": "Package", "exam_id": None, "papers": []
-        })
+        package = package_nodes.get(pid)
+        if package is None:
+            # Ignore orphan package-test rows instead of creating a fake package.
+            # Every package shown by this endpoint must come from the database.
+            continue
         package.setdefault("subjects", {})
         sid, cid, tid = int(r["subject_id"]), int(r["chapter_id"]), int(r["topic_id"])
         subject = package["subjects"].setdefault(sid, {
