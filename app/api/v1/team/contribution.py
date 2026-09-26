@@ -3,12 +3,11 @@ Accqudo Team Contribution Dashboard.
 
 GET /api/v1/team/contribution
 
-Only the authenticated ADMIN/SUPER_ADMIN sees this endpoint, and it returns
-ONLY that user's own contribution data.
+Only authenticated ADMIN, TEAM, and SUPER_ADMIN users can access this endpoint.
+It returns only the authenticated user's own contribution data.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from datetime import datetime
 from typing import Any
 
@@ -52,7 +51,7 @@ async def contribution_dashboard(
     db: AsyncSession = Depends(get_db),
 ):
     if norm(getattr(current_user, "role", None)) not in ALLOWED_ROLES:
-        raise HTTPException(403, "Only ADMIN and SUPER_ADMIN can access contributions.")
+        raise HTTPException(403, "Only ADMIN,TEAM and SUPER_ADMIN can access contributions.")
 
     user_id = int(current_user.id)
 
@@ -66,7 +65,7 @@ async def contribution_dashboard(
           (SELECT COUNT(*) FROM chapters WHERE created_by=:uid) AS chapters,
           (SELECT COUNT(*) FROM topics WHERE created_by=:uid) AS topics,
           (SELECT COUNT(*) FROM questions WHERE created_by=:uid) AS questions,
-          (SELECT COUNT(*) FROM package_tests WHERE created_by=:uid) AS packages,
+          (SELECT COUNT(DISTINCT package_id) FROM package_tests WHERE created_by=:uid) AS packages,
           (SELECT COUNT(*) FROM tests WHERE created_by=:uid) AS papers_assembled,
           (SELECT COUNT(*) FROM test_questions WHERE added_by=:uid) AS questions_added_to_papers
     """, {"uid": user_id})
@@ -116,23 +115,24 @@ async def contribution_dashboard(
         ORDER BY tq.test_id DESC, tq.`order`
     """, {"uid": user_id})
 
-    # Package -> test relation from the actual package_tests table.
+    # Package -> test relations attributed to the current user.
+    #
+    # IMPORTANT:
+    # `created_by` is stored on package_tests in the current database.
+    # We therefore scope the complete package section by pt.created_by.
+    # The packages table is used only for package metadata (title/exam_id).
     package_tests = await rows(db, """
-        SELECT pt.package_id, pt.test_id, p.title AS package_title,
-               p.exam_id AS package_exam_id, t.title AS test_title
+        SELECT DISTINCT
+               pt.package_id,
+               pt.test_id,
+               p.title AS package_title,
+               p.exam_id AS package_exam_id,
+               t.title AS test_title
         FROM package_tests pt
         JOIN packages p ON p.id=pt.package_id
         JOIN tests t ON t.id=pt.test_id
-    """)
-
-    package_owned = await rows(db, """
-        SELECT p.id, p.title, p.description, p.exam_id,
-               e.title AS exam_title, e.code AS exam_code,
-               p.price_paise, p.is_active, p.created_at
-        FROM packages p
-        LEFT JOIN exams e ON e.id=p.exam_id
-        WHERE p.created_by=:uid
-        ORDER BY p.created_at DESC, p.id DESC
+        WHERE pt.created_by=:uid
+        ORDER BY pt.package_id, pt.test_id
     """, {"uid": user_id})
 
     # Direct hierarchy: subject -> chapter -> topic.
@@ -202,8 +202,9 @@ async def contribution_dashboard(
         SELECT pt.package_id, tq.test_id, COUNT(*) AS total_questions
         FROM package_tests pt
         JOIN test_questions tq ON tq.test_id=pt.test_id
+        WHERE pt.created_by=:uid
         GROUP BY pt.package_id, tq.test_id
-    """)
+    """, {"uid": user_id})
     paper_totals = {(int(r["package_id"]), int(r["test_id"])): int(r["total_questions"] or 0) for r in total_paper_rows}
 
     contributed_paper_rows = await rows(db, """
@@ -217,7 +218,8 @@ async def contribution_dashboard(
         JOIN topics tp ON tp.id=q.topic_id
         JOIN chapters c ON c.id=tp.chapter_id
         JOIN subjects s ON s.id=c.subject_id
-        WHERE q.created_by=:uid
+        WHERE pt.created_by=:uid
+          AND q.created_by=:uid
         ORDER BY pt.package_id, tq.test_id, tq.`order`
     """, {"uid": user_id})
 
@@ -261,6 +263,7 @@ async def contribution_dashboard(
         JOIN topics tp ON tp.id = q.topic_id
         JOIN chapters c ON c.id = tp.chapter_id
         JOIN subjects s ON s.id = c.subject_id
+        WHERE pt.created_by = :uid
         GROUP BY pt.package_id, s.id, s.name, c.id, c.name, tp.id, tp.name
         ORDER BY pt.package_id, s.name, c.name, tp.name
     """, {"uid": user_id})
@@ -310,17 +313,6 @@ async def contribution_dashboard(
         package["academic_contributed_questions"] = sum(s["contributed_questions"] for s in subject_list)
         package["academic_total_questions"] = sum(s["total_questions"] for s in subject_list)
         package["academic_contribution_percent"] = round(100 * package["academic_contributed_questions"] / package["academic_total_questions"], 1) if package["academic_total_questions"] else 0
-
-    # Package-owned rows may have no package/test relation yet; expose them too.
-    for r in package_owned:
-        pid = int(r["id"])
-        package_nodes.setdefault(pid, {
-            "id": pid, "title": r["title"], "exam_id": r["exam_id"], "papers": [],
-            "subjects": [],
-            "paper_count": 0, "contributed_questions": 0, "total_questions": 0,
-            "contribution_percent": 0, "academic_contributed_questions": 0,
-            "academic_total_questions": 0, "academic_contribution_percent": 0
-        })
 
     package_hierarchy = sorted(package_nodes.values(), key=lambda x: x["title"].lower())
 
