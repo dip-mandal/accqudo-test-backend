@@ -66,7 +66,7 @@ async def contribution_dashboard(
           (SELECT COUNT(*) FROM chapters WHERE created_by=:uid) AS chapters,
           (SELECT COUNT(*) FROM topics WHERE created_by=:uid) AS topics,
           (SELECT COUNT(*) FROM questions WHERE created_by=:uid) AS questions,
-          (SELECT COUNT(*) FROM packages WHERE created_by=:uid) AS packages,
+          (SELECT COUNT(*) FROM package_tests WHERE created_by=:uid) AS packages,
           (SELECT COUNT(*) FROM tests WHERE created_by=:uid) AS papers_assembled,
           (SELECT COUNT(*) FROM test_questions WHERE added_by=:uid) AS questions_added_to_papers
     """, {"uid": user_id})
@@ -116,12 +116,11 @@ async def contribution_dashboard(
         ORDER BY tq.test_id DESC, tq.`order`
     """, {"uid": user_id})
 
-    # Current package -> test relation. The old package_tests belongs to the
-    # legacy subscription_packages table, so it must not be used here.
+    # Package -> test relation from the actual package_tests table.
     package_tests = await rows(db, """
         SELECT pt.package_id, pt.test_id, p.title AS package_title,
                p.exam_id AS package_exam_id, t.title AS test_title
-        FROM package_tests_current pt
+        FROM package_tests pt
         JOIN packages p ON p.id=pt.package_id
         JOIN tests t ON t.id=pt.test_id
     """)
@@ -201,7 +200,7 @@ async def contribution_dashboard(
 
     total_paper_rows = await rows(db, """
         SELECT pt.package_id, tq.test_id, COUNT(*) AS total_questions
-        FROM package_tests_current pt
+        FROM package_tests pt
         JOIN test_questions tq ON tq.test_id=pt.test_id
         GROUP BY pt.package_id, tq.test_id
     """)
@@ -212,7 +211,7 @@ async def contribution_dashboard(
                tp.id AS topic_id, tp.name AS topic_name,
                c.id AS chapter_id, c.name AS chapter_name,
                s.id AS subject_id, s.name AS subject_name
-        FROM package_tests_current pt
+        FROM package_tests pt
         JOIN test_questions tq ON tq.test_id=pt.test_id
         JOIN questions q ON q.id=tq.question_id
         JOIN topics tp ON tp.id=q.topic_id
@@ -256,7 +255,7 @@ async def contribution_dashboard(
             tp.id AS topic_id, tp.name AS topic_name,
             COUNT(DISTINCT q.id) AS total_questions,
             COUNT(DISTINCT CASE WHEN q.created_by = :uid THEN q.id END) AS contributed_questions
-        FROM package_tests_current pt
+        FROM package_tests pt
         JOIN test_questions tq ON tq.test_id = pt.test_id
         JOIN questions q ON q.id = tq.question_id
         JOIN topics tp ON tp.id = q.topic_id
