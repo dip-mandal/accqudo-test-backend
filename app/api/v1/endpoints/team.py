@@ -18,6 +18,58 @@ router = APIRouter(
 )
 
 
+async def _set_created_by(
+    db: AsyncSession,
+    table_name: str,
+    id_column: str,
+    record_id: int,
+    user_id: int,
+) -> None:
+    """Persist ownership directly in the existing database schema."""
+    result = await db.execute(
+        text(
+            f"UPDATE {table_name} "
+            f"SET created_by = :uid "
+            f"WHERE {id_column} = :record_id"
+        ),
+        {"uid": user_id, "record_id": record_id},
+    )
+
+    if result.rowcount != 1:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Could not persist created_by for {table_name} "
+                f"record #{record_id}."
+            ),
+        )
+
+
+async def _set_added_by(
+    db: AsyncSession,
+    record_id: int,
+    user_id: int,
+) -> None:
+    """Persist the authenticated user on a test-question row."""
+    result = await db.execute(
+        text(
+            "UPDATE test_questions "
+            "SET added_by = :uid "
+            "WHERE id = :record_id"
+        ),
+        {"uid": user_id, "record_id": record_id},
+    )
+
+    if result.rowcount != 1:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Could not persist added_by for "
+                f"test_questions record #{record_id}."
+            ),
+        )
+
+
 # ============================================================
 # EXAM HIERARCHY
 # ============================================================
@@ -265,18 +317,24 @@ async def create_question(
     db.add(question)
     await db.flush()
 
-    # The database has a created_by column, but the SQLAlchemy Question model
-    # does not expose it. Write ownership with SQL so we do not change the
-    # existing ORM model/schema.
-    await db.execute(
-        text("UPDATE questions SET created_by = :uid WHERE id = :qid"),
-        {"uid": current_user.id, "qid": question.id},
+    # The ORM model does not expose created_by, so persist ownership in the
+    # existing database schema without changing the model.
+    await _set_created_by(
+        db,
+        table_name="questions",
+        id_column="id",
+        record_id=question.id,
+        user_id=current_user.id,
     )
 
     await db.commit()
     await db.refresh(question)
 
-    return {"question_id": question.id, "status": "created"}
+    return {
+        "question_id": question.id,
+        "created_by": current_user.id,
+        "status": "created",
+    }
 
 
 # ============================================================
@@ -387,10 +445,14 @@ async def assemble_test(
     db.add(test)
     await db.flush()
 
-    # The database has tests.created_by, but the ORM model does not expose it.
-    await db.execute(
-        text("UPDATE tests SET created_by = :uid WHERE id = :tid"),
-        {"uid": current_user.id, "tid": test.id},
+    # The ORM model does not expose tests.created_by, so persist ownership
+    # directly in the existing database schema.
+    await _set_created_by(
+        db,
+        table_name="tests",
+        id_column="id",
+        record_id=test.id,
+        user_id=current_user.id,
     )
 
     for order, (question_id, marks, negative_marks) in enumerate(prepared, start=1):
@@ -405,9 +467,10 @@ async def assemble_test(
         await db.flush()
         # Attribute this paper addition to the authenticated user without
         # adding an unsupported field to the ORM model.
-        await db.execute(
-            text("UPDATE test_questions SET added_by = :uid WHERE id = :tqid"),
-            {"uid": current_user.id, "tqid": test_question.id},
+        await _set_added_by(
+            db,
+            record_id=test_question.id,
+            user_id=current_user.id,
         )
 
     package_ids = payload.get("package_ids") or []
@@ -458,6 +521,7 @@ async def assemble_test(
         "title": test.title,
         "question_count": len(prepared),
         "total_marks": total_marks,
+        "created_by": current_user.id,
         "status": "created",
     }
 
@@ -544,9 +608,12 @@ async def create_subject(
 
     db.add(subject)
     await db.flush()
-    await db.execute(
-        text("UPDATE subjects SET created_by = :uid WHERE id = :sid"),
-        {"uid": current_user.id, "sid": subject.id},
+    await _set_created_by(
+        db,
+        table_name="subjects",
+        id_column="id",
+        record_id=subject.id,
+        user_id=current_user.id,
     )
 
     await db.commit()
@@ -594,9 +661,12 @@ async def create_chapter(
 
     db.add(chapter)
     await db.flush()
-    await db.execute(
-        text("UPDATE chapters SET created_by = :uid WHERE id = :cid"),
-        {"uid": current_user.id, "cid": chapter.id},
+    await _set_created_by(
+        db,
+        table_name="chapters",
+        id_column="id",
+        record_id=chapter.id,
+        user_id=current_user.id,
     )
 
     await db.commit()
@@ -644,9 +714,12 @@ async def create_topic(
 
     db.add(topic)
     await db.flush()
-    await db.execute(
-        text("UPDATE topics SET created_by = :uid WHERE id = :tid"),
-        {"uid": current_user.id, "tid": topic.id},
+    await _set_created_by(
+        db,
+        table_name="topics",
+        id_column="id",
+        record_id=topic.id,
+        user_id=current_user.id,
     )
 
     await db.commit()
