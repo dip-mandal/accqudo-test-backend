@@ -510,8 +510,19 @@ async def assemble_test(
                 },
             )
 
+        # package_tests.created_by is an existing database column.
+        # Persist it together with the package/test relationship so the
+        # contribution dashboard can attribute the package linkage to the
+        # authenticated team member.
         for package_id in package_ids:
-            db.add(PackageTest(package_id=package_id, test_id=test.id))
+            package_test = PackageTest(
+                package_id=package_id,
+                test_id=test.id,
+                created_by=current_user.id,
+            )
+            db.add(package_test)
+
+        await db.flush()
 
     await db.commit()
     await db.refresh(test)

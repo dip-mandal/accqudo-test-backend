@@ -48,6 +48,15 @@ package_tests_table = Table(
         ForeignKey("tests.id", ondelete="CASCADE"),
         primary_key=True,
     ),
+    # Existing database column used to attribute package/test linkage
+    # to the authenticated team member who created the relationship.
+    Column(
+        "created_by",
+        BigInteger,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    ),
     extend_existing=True,
 )
 

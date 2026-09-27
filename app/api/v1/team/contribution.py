@@ -120,7 +120,7 @@ async def contribution_dashboard(
     # IMPORTANT:
     # `created_by` is stored on package_tests in the current database.
     # We therefore scope the complete package section by pt.created_by.
-    # The packages table is used only for package metadata (title/exam_id).
+    # The subscription_packages table is used for package metadata (title/exam_id).
     package_tests = await rows(db, """
         SELECT DISTINCT
                pt.package_id,
@@ -129,7 +129,7 @@ async def contribution_dashboard(
                p.exam_id AS package_exam_id,
                t.title AS test_title
         FROM package_tests pt
-        JOIN packages p ON p.id=pt.package_id
+        JOIN subscription_packages p ON p.id=pt.package_id
         JOIN tests t ON t.id=pt.test_id
         WHERE pt.created_by=:uid
         ORDER BY pt.package_id, pt.test_id
