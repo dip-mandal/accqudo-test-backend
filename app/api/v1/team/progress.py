@@ -5,7 +5,7 @@ Routes
 ------
 GET  /api/v1/team/progress/dashboard?period=1m|3m|6m|1y|all
 GET  /api/v1/team/progress/report/member/{user_id}?period=...
-GET  /api/v1/team/progress/report/member/{user_id}/download?period=...
+GET  /api/v1/team/progress/report/member/{user_id}/download?period=...  (PDF)
 GET  /api/v1/team/progress/report/sales/download?period=...
 GET  /api/v1/team/progress/report/sales/packages/download?period=...
 
@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import csv
 import io
-import math
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -1194,24 +1193,57 @@ def _fit_pdf_widths(widths: Optional[List[float]]) -> Optional[List[float]]:
     return [w * scale for w in widths]
 
 
-def _pdf_table(data: List[List[Any]], widths: Optional[List[float]] = None, header: bool = True, font_size: float = 7.2):
+def _pdf_table(
+    data: List[List[Any]],
+    widths: Optional[List[float]] = None,
+    header: bool = True,
+    font_size: float = 7.2,
+):
+    """Create a page-safe ReportLab table.
+
+    Every table is constrained to the A4 content frame. Explicit column widths
+    are proportionally reduced when necessary, while Paragraph cells wrap long
+    names instead of allowing text to run past the right page edge.
+    """
     widths = _fit_pdf_widths(widths)
+    cell_style = ParagraphStyle(
+        "AccqudoTableCell",
+        fontName="Helvetica",
+        fontSize=font_size,
+        leading=max(font_size + 1.7, 7.2),
+        textColor=colors.HexColor("#344054"),
+        wordWrap="LTR",
+        splitLongWords=1,
+    )
     converted = []
     for row in data:
-        converted.append([x if isinstance(x, Paragraph) else Paragraph(_pdf_text(x), ParagraphStyle("cell", fontName="Helvetica", fontSize=font_size, leading=font_size+2, textColor=colors.HexColor("#344054"))) for x in row])
-    table = Table(converted, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
+        converted.append([
+            x if isinstance(x, Paragraph) else Paragraph(_pdf_text(x), cell_style)
+            for x in row
+        ])
+
+    table = Table(
+        converted,
+        colWidths=widths,
+        repeatRows=1 if header else 0,
+        hAlign="LEFT",
+        splitByRow=1,
+        spaceBefore=0,
+        spaceAfter=0,
+    )
+
     style = [
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 4),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E4E7EC")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9DEE7")),
     ]
     if header and converted:
         style += [
-            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F4F7")),
-            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#344054")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEF2F6")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#24364B")),
             ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ]
     table.setStyle(TableStyle(style))
@@ -1228,28 +1260,46 @@ class _AccqudoPDF(BaseDocTemplate):
         self.generated_at = generated_at
 
     def _draw_header_footer(self, canvas, doc):
+        """Draw the same clean Accqudo letterhead on every page."""
         canvas.saveState()
         width, height = A4
+        left = 14 * mm
+        right = width - 14 * mm
+
         navy = colors.HexColor("#16293F")
         blue = colors.HexColor("#1F3A5C")
         muted = colors.HexColor("#667085")
+        light = colors.HexColor("#E4E7EC")
+
+        # Official letterhead / wordmark
         canvas.setFillColor(navy)
         canvas.setFont("Helvetica-Bold", 17)
-        canvas.drawString(14*mm, height-15*mm, "ACCQUDO")
-        canvas.setFillColor(blue)
-        canvas.setFont("Helvetica-Bold", 7)
-        canvas.drawString(14*mm, height-20*mm, "EDUCATION • PRACTICE • PERFORMANCE")
-        canvas.setFillColor(muted)
-        canvas.setFont("Helvetica", 6.5)
-        canvas.drawRightString(width-14*mm, height-15*mm, "INTERNAL CONTRIBUTION REPORT")
-        canvas.line(14*mm, height-23*mm, width-14*mm, height-23*mm)
+        canvas.drawString(left, height - 14 * mm, "ACCQUDO")
 
-        canvas.setStrokeColor(colors.HexColor("#E4E7EC"))
-        canvas.line(14*mm, 12*mm, width-14*mm, 12*mm)
+        canvas.setFillColor(blue)
+        canvas.setFont("Helvetica-Bold", 6.8)
+        canvas.drawString(left, height - 19 * mm, "EDUCATION • PRACTICE • PERFORMANCE")
+
         canvas.setFillColor(muted)
-        canvas.setFont("Helvetica", 6.5)
-        canvas.drawString(14*mm, 7.5*mm, "Accqudo • accqudo.com • Confidential internal document")
-        canvas.drawRightString(width-14*mm, 7.5*mm, f"Page {doc.page}")
+        canvas.setFont("Helvetica-Bold", 6.2)
+        canvas.drawRightString(right, height - 13.5 * mm, "INTERNAL CONTRIBUTION REPORT")
+        canvas.setFont("Helvetica", 5.8)
+        canvas.drawRightString(right, height - 18.5 * mm, "STAFF PERFORMANCE • CONFIDENTIAL")
+
+        canvas.setStrokeColor(navy)
+        canvas.setLineWidth(0.8)
+        canvas.line(left, height - 22.5 * mm, right, height - 22.5 * mm)
+
+        # Footer
+        canvas.setStrokeColor(light)
+        canvas.setLineWidth(0.5)
+        canvas.line(left, 12.5 * mm, right, 12.5 * mm)
+
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 6.2)
+        canvas.drawString(left, 7.8 * mm, "ACCQUDO  •  accqudo.com  •  Confidential internal document")
+        canvas.drawRightString(right, 7.8 * mm, f"Page {doc.page}")
+
         canvas.restoreState()
 
 
@@ -1427,7 +1477,11 @@ async def download_member_report(
     return StreamingResponse(
         pdf,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"; filename*=UTF-8\'\'{filename}',
+            "Cache-Control": "no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
