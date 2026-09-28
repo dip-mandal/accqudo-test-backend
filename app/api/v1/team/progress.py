@@ -496,8 +496,13 @@ async def fetch_sales(db: AsyncSession, source: str, start: Optional[datetime]) 
 
 
 async def fetch_packages(db: AsyncSession, source: str) -> List[Dict[str, Any]]:
+    """Read package catalog and normalize price to INR.
+
+    Current ``packages.price_paise`` is stored in paise.
+    Legacy ``subscription_packages.price`` is already stored in INR.
+    """
     if source == "current":
-        return await rows(
+        package_rows = await rows(
             db,
             """
             SELECT id, exam_id, title, description, price_paise, discount_paise,
@@ -506,7 +511,17 @@ async def fetch_packages(db: AsyncSession, source: str) -> List[Dict[str, Any]]:
             FROM packages ORDER BY created_at DESC, id DESC
             """,
         )
-    return await rows(
+
+        return [
+            {
+                **p,
+                "price_inr": round(money(p.get("price_paise")) / 100.0, 2),
+                "tier": None,
+            }
+            for p in package_rows
+        ]
+
+    package_rows = await rows(
         db,
         """
         SELECT id, exam_id, title, description, tier, price, validity_days,
@@ -514,6 +529,17 @@ async def fetch_packages(db: AsyncSession, source: str) -> List[Dict[str, Any]]:
         FROM subscription_packages ORDER BY created_at DESC, id DESC
         """,
     )
+
+    normalized: List[Dict[str, Any]] = []
+    for p in package_rows:
+        # IMPORTANT: the legacy sells implementation treats ``price`` as INR.
+        price_inr = round(money(p.get("price")), 2)
+        normalized.append({
+            **p,
+            "price_inr": price_inr,
+            "price_paise": int(round(price_inr * 100)),
+        })
+    return normalized
 
 
 async def fetch_subscription_rows(db: AsyncSession, source: str) -> List[Dict[str, Any]]:
@@ -577,7 +603,7 @@ async def get_sales_report(db: AsyncSession, start: Optional[datetime]) -> Dict[
     performance: Dict[int, Dict[str, Any]] = {}
     for p in packages:
         pid = int(p["id"])
-        price = money(p.get("price_inr")) if source == "legacy" else money(p.get("price_paise")) / 100
+        price = money(p.get("price_inr"))
         performance[pid] = {
             "package_id": pid,
             "package_title": p.get("title"),
