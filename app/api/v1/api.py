@@ -14,6 +14,7 @@ from app.api.v1.endpoints import (
 )
 
 from app.api.v1.team import contribution
+from app.api.v1.team.progress import router as team_progress_router
 
 api_router = APIRouter()
 
@@ -32,6 +33,8 @@ api_router.include_router(admin.router, prefix="/admin", tags=["Admin Studio & C
 api_router.include_router(sells.router)
 
 api_router.include_router(contribution.router)
+
+api_router.include_router(team_progress_router)
 
 
 api_router.include_router(
