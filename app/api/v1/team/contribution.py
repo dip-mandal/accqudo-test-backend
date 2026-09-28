@@ -141,10 +141,14 @@ async def contribution_dashboard(
     if topic_ids:
         placeholders = ",".join(f":t{i}" for i in range(len(topic_ids)))
         params = {f"t{i}": value for i, value in enumerate(topic_ids)}
+        # Count only questions attributed to a contributor. This prevents
+        # legacy/imported questions with created_by=NULL from inflating the
+        # denominator of the contribution percentage.
         totals = await rows(db, f"""
             SELECT topic_id, COUNT(*) AS total_questions
             FROM questions
             WHERE topic_id IN ({placeholders})
+              AND created_by IS NOT NULL
             GROUP BY topic_id
         """, params)
         total_by_topic = {int(r["topic_id"]): int(r["total_questions"] or 0) for r in totals}
