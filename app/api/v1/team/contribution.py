@@ -171,23 +171,71 @@ async def contribution_dashboard(
         })
         topic["contributed_questions"] += 1
         chapter["contributed_questions"] += 1
-        chapter["total_questions"] += total_by_topic.get(tid, 0)
         subject["contributed_questions"] += 1
-        subject["total_questions"] += total_by_topic.get(tid, 0)
 
     hierarchy = []
     for subject in subjects.values():
         chapters = []
+
         for chapter in subject["chapters"].values():
-            chapter["topics"] = sorted(chapter["topics"].values(), key=lambda x: x["name"].lower())
-            chapter["contribution_percent"] = round(100 * chapter["contributed_questions"] / chapter["total_questions"], 1) if chapter["total_questions"] else 0
+            # Each topic's total is already the total number of questions in
+            # that topic. Add each topic total exactly once to the parent
+            # chapter. Do NOT add the topic total once per contributed
+            # question, otherwise the denominator becomes inflated.
+            for topic in chapter["topics"].values():
+                chapter["total_questions"] += topic["total_questions"]
+
+            chapter["topics"] = sorted(
+                chapter["topics"].values(),
+                key=lambda x: x["name"].lower(),
+            )
+            chapter["contribution_percent"] = (
+                round(
+                    100 * chapter["contributed_questions"]
+                    / chapter["total_questions"],
+                    1,
+                )
+                if chapter["total_questions"]
+                else 0
+            )
             chapters.append(chapter)
-        subject["chapters"] = sorted(chapters, key=lambda x: x["name"].lower())
-        subject["contribution_percent"] = round(100 * subject["contributed_questions"] / subject["total_questions"], 1) if subject["total_questions"] else 0
+
+        subject["chapters"] = sorted(
+            chapters,
+            key=lambda x: x["name"].lower(),
+        )
+
+        # Build the subject denominator from each topic exactly once.
+        subject["total_questions"] = sum(
+            topic["total_questions"]
+            for chapter in subject["chapters"]
+            for topic in chapter["topics"]
+        )
+
+        subject["contribution_percent"] = (
+            round(
+                100 * subject["contributed_questions"]
+                / subject["total_questions"],
+                1,
+            )
+            if subject["total_questions"]
+            else 0
+        )
+
         for chapter in subject["chapters"]:
             for topic in chapter["topics"]:
-                topic["contribution_percent"] = round(100 * topic["contributed_questions"] / topic["total_questions"], 1) if topic["total_questions"] else 0
+                topic["contribution_percent"] = (
+                    round(
+                        100 * topic["contributed_questions"]
+                        / topic["total_questions"],
+                        1,
+                    )
+                    if topic["total_questions"]
+                    else 0
+                )
+
         hierarchy.append(subject)
+
     hierarchy.sort(key=lambda x: x["name"].lower())
 
     # Package -> paper -> user's contributed questions.
