@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from collections import defaultdict
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -47,6 +48,23 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    BaseDocTemplate,
+    Frame,
+    PageTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    PageBreak,
+    KeepTogether,
+)
 
 from app.core.database import get_db
 from app.core.security import get_current_user
@@ -69,6 +87,10 @@ def normalize(value: Any) -> str:
     if value is None:
         return ""
     return str(getattr(value, "value", value)).strip().upper()
+
+
+def role_label(value: Any) -> str:
+    return normalize(value).replace("_", " ")
 
 
 def money(value: Any) -> float:
@@ -347,11 +369,25 @@ async def get_monthly_activity(db: AsyncSession, start: Optional[datetime]) -> L
     ]
 
 
-async def get_member_details(db: AsyncSession, user_id: int) -> Dict[str, Any]:
-    """Detailed records supported by the same ownership fields as contribution.py."""
+async def get_member_details(
+    db: AsyncSession,
+    user_id: int,
+    start: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Return the complete attributable work of one staff member.
+
+    The academic breakdown intentionally follows the exact ownership fields
+    used by the working team/contribution endpoint supplied with the project.
+    Questions and papers can be period-filtered because they have created_at;
+    test_questions.added_by and package_tests.created_by are lifetime/current
+    relationship metrics because those tables have no reliable creation time.
+    """
+    q_condition, q_params = date_condition("q.created_at", start, "q_start")
+    t_condition, t_params = date_condition("t.created_at", start, "t_start")
+
     questions = await rows(
         db,
-        """
+        f"""
         SELECT q.id AS question_id, q.question_type, q.created_at,
                tp.id AS topic_id, tp.name AS topic_name,
                c.id AS chapter_id, c.name AS chapter_name,
@@ -362,24 +398,24 @@ async def get_member_details(db: AsyncSession, user_id: int) -> Dict[str, Any]:
         JOIN chapters c ON c.id=tp.chapter_id
         JOIN subjects s ON s.id=c.subject_id
         LEFT JOIN exams e ON e.id=s.exam_id
-        WHERE q.created_by=:uid
+        WHERE q.created_by=:uid {q_condition}
         ORDER BY q.created_at DESC, q.id DESC
         """,
-        {"uid": user_id},
+        {"uid": user_id, **q_params},
     )
     papers = await rows(
         db,
-        """
+        f"""
         SELECT t.id, t.title, t.exam_id, e.title AS exam_title, e.code AS exam_code,
                t.duration_minutes, t.total_marks, t.created_at,
                (SELECT COUNT(*) FROM test_questions tq WHERE tq.test_id=t.id) AS total_questions,
                (SELECT COUNT(*) FROM test_questions tq WHERE tq.test_id=t.id AND tq.added_by=:uid) AS questions_added_by_me
         FROM tests t
         LEFT JOIN exams e ON e.id=t.exam_id
-        WHERE t.created_by=:uid
+        WHERE t.created_by=:uid {t_condition}
         ORDER BY t.created_at DESC, t.id DESC
         """,
-        {"uid": user_id},
+        {"uid": user_id, **t_params},
     )
     additions = await rows(
         db,
@@ -400,21 +436,200 @@ async def get_member_details(db: AsyncSession, user_id: int) -> Dict[str, Any]:
         """,
         {"uid": user_id},
     )
+
+    # Resolve package titles from either catalog. This keeps the report useful
+    # across the current and legacy package implementations.
     package_links = await rows(
         db,
         """
         SELECT DISTINCT pt.package_id, pt.test_id,
-               p.title AS package_title, p.exam_id AS package_exam_id,
-               t.title AS test_title
+               sp.title AS legacy_package_title, sp.exam_id AS legacy_package_exam_id,
+               t.title AS test_title, t.exam_id AS test_exam_id
         FROM package_tests pt
-        LEFT JOIN subscription_packages p ON p.id=pt.package_id
+        LEFT JOIN subscription_packages sp ON sp.id=pt.package_id
         JOIN tests t ON t.id=pt.test_id
         WHERE pt.created_by=:uid
         ORDER BY pt.package_id, pt.test_id
         """,
         {"uid": user_id},
     )
-    return {"questions": questions, "papers": papers, "additions": additions, "package_links": package_links}
+    package_ids = sorted({int(r["package_id"]) for r in package_links if r.get("package_id") is not None})
+    package_meta: Dict[int, Dict[str, Any]] = {}
+    if package_ids:
+        placeholders = ",".join(f":pid_{i}" for i in range(len(package_ids)))
+        params = {f"pid_{i}": pid for i, pid in enumerate(package_ids)}
+        try:
+            current_packages = await rows(
+                db,
+                f"""
+                SELECT id, title, exam_id FROM packages WHERE id IN ({placeholders})
+                """,
+                params,
+            )
+            package_meta.update({int(r["id"]): {"title": r.get("title"), "exam_id": r.get("exam_id")} for r in current_packages})
+        except Exception:
+            pass
+        for r in package_links:
+            pid = int(r["package_id"])
+            if pid not in package_meta:
+                package_meta[pid] = {
+                    "title": r.get("legacy_package_title"),
+                    "exam_id": r.get("legacy_package_exam_id"),
+                }
+
+    for r in package_links:
+        pid = int(r["package_id"])
+        meta = package_meta.get(pid, {})
+        r["package_title"] = meta.get("title") or r.get("legacy_package_title") or f"Package #{pid}"
+        r["package_exam_id"] = meta.get("exam_id") or r.get("legacy_package_exam_id")
+
+    # Complete academic hierarchy for questions authored by the selected user.
+    hierarchy_map: Dict[int, Dict[str, Any]] = {}
+    for r in questions:
+        eid = int(r["exam_id"]) if r.get("exam_id") is not None else None
+        sid, cid, tid = int(r["subject_id"]), int(r["chapter_id"]), int(r["topic_id"])
+        exam_key = eid if eid is not None else 0
+        exam = hierarchy_map.setdefault(exam_key, {
+            "id": eid, "title": r.get("exam_title") or "Unassigned Exam", "code": r.get("exam_code"),
+            "contributed_questions": 0, "subjects": {},
+        })
+        subject = exam["subjects"].setdefault(sid, {
+            "id": sid, "name": r["subject_name"], "contributed_questions": 0, "chapters": {},
+        })
+        chapter = subject["chapters"].setdefault(cid, {
+            "id": cid, "name": r["chapter_name"], "contributed_questions": 0, "topics": {},
+        })
+        topic = chapter["topics"].setdefault(tid, {
+            "id": tid, "name": r["topic_name"], "contributed_questions": 0,
+        })
+        topic["contributed_questions"] += 1
+        chapter["contributed_questions"] += 1
+        subject["contributed_questions"] += 1
+        exam["contributed_questions"] += 1
+
+    # Denominators: all contributor-attributed questions in the same academic
+    # nodes, matching the contribution backend's anti-import inflation rule.
+    topic_ids = sorted({int(r["topic_id"]) for r in questions})
+    total_by_topic: Dict[int, int] = {}
+    if topic_ids:
+        placeholders = ",".join(f":tid_{i}" for i in range(len(topic_ids)))
+        params = {f"tid_{i}": tid for i, tid in enumerate(topic_ids)}
+        condition = ""
+        if start is not None:
+            condition = " AND created_at >= :topic_start"
+            params["topic_start"] = start
+        totals = await rows(
+            db,
+            f"""
+            SELECT topic_id, COUNT(*) AS total_questions
+            FROM questions
+            WHERE topic_id IN ({placeholders}) AND created_by IS NOT NULL {condition}
+            GROUP BY topic_id
+            """,
+            params,
+        )
+        total_by_topic = {int(r["topic_id"]): int(r["total_questions"] or 0) for r in totals}
+
+    academic_breakdown: List[Dict[str, Any]] = []
+    for exam in hierarchy_map.values():
+        subject_list = []
+        exam_total = 0
+        for subject in exam["subjects"].values():
+            chapter_list = []
+            subject_total = 0
+            for chapter in subject["chapters"].values():
+                topic_list = []
+                chapter_total = 0
+                for topic in chapter["topics"].values():
+                    total = total_by_topic.get(int(topic["id"]), 0)
+                    topic["total_questions"] = total
+                    topic["contribution_percent"] = round(100 * topic["contributed_questions"] / total, 1) if total else 0.0
+                    chapter_total += total
+                    topic_list.append(topic)
+                chapter["topics"] = sorted(topic_list, key=lambda x: x["name"].lower())
+                chapter["total_questions"] = chapter_total
+                chapter["contribution_percent"] = round(100 * chapter["contributed_questions"] / chapter_total, 1) if chapter_total else 0.0
+                subject_total += chapter_total
+                chapter_list.append(chapter)
+            subject["chapters"] = sorted(chapter_list, key=lambda x: x["name"].lower())
+            subject["total_questions"] = subject_total
+            subject["contribution_percent"] = round(100 * subject["contributed_questions"] / subject_total, 1) if subject_total else 0.0
+            exam_total += subject_total
+            subject_list.append(subject)
+        exam["subjects"] = sorted(subject_list, key=lambda x: x["name"].lower())
+        exam["total_questions"] = exam_total
+        exam["contribution_percent"] = round(100 * exam["contributed_questions"] / exam_total, 1) if exam_total else 0.0
+        academic_breakdown.append(exam)
+    academic_breakdown.sort(key=lambda x: str(x["title"]).lower())
+
+    by_type: Dict[str, int] = defaultdict(int)
+    by_exam: Dict[str, int] = defaultdict(int)
+    by_subject: Dict[str, int] = defaultdict(int)
+    by_chapter: Dict[str, int] = defaultdict(int)
+    by_topic: Dict[str, int] = defaultdict(int)
+    for r in questions:
+        by_type[normalize(r.get("question_type")) or "UNKNOWN"] += 1
+        by_exam[r.get("exam_title") or "Unassigned Exam"] += 1
+        by_subject[r.get("subject_name") or "Unknown Subject"] += 1
+        by_chapter[r.get("chapter_name") or "Unknown Chapter"] += 1
+        by_topic[r.get("topic_name") or "Unknown Topic"] += 1
+
+    # Package-level contribution: every package-test relation created by the
+    # member, plus distinct questions authored by the member inside those tests.
+    package_contrib_rows = await rows(
+        db,
+        """
+        SELECT pt.package_id, pt.test_id,
+               COUNT(DISTINCT tq.question_id) AS total_questions,
+               COUNT(DISTINCT CASE WHEN q.created_by=:uid THEN q.id END) AS contributed_questions
+        FROM package_tests pt
+        JOIN test_questions tq ON tq.test_id=pt.test_id
+        JOIN questions q ON q.id=tq.question_id
+        WHERE pt.created_by=:uid
+        GROUP BY pt.package_id, pt.test_id
+        ORDER BY pt.package_id, pt.test_id
+        """,
+        {"uid": user_id},
+    )
+    package_contributions: Dict[int, Dict[str, Any]] = {}
+    for r in package_contrib_rows:
+        pid = int(r["package_id"])
+        package_contributions.setdefault(pid, {
+            "package_id": pid,
+            "package_title": package_meta.get(pid, {}).get("title") or f"Package #{pid}",
+            "exam_id": package_meta.get(pid, {}).get("exam_id"),
+            "papers": [],
+        })
+        total = int(r["total_questions"] or 0)
+        contributed = int(r["contributed_questions"] or 0)
+        package_contributions[pid]["papers"].append({
+            "test_id": int(r["test_id"]),
+            "total_questions": total,
+            "contributed_questions": contributed,
+            "contribution_percent": round(100 * contributed / total, 1) if total else 0.0,
+        })
+    for item in package_contributions.values():
+        item["papers"].sort(key=lambda x: x["test_id"])
+        item["total_questions"] = sum(x["total_questions"] for x in item["papers"])
+        item["contributed_questions"] = sum(x["contributed_questions"] for x in item["papers"])
+        item["contribution_percent"] = round(100 * item["contributed_questions"] / item["total_questions"], 1) if item["total_questions"] else 0.0
+    package_contributions_list = sorted(package_contributions.values(), key=lambda x: str(x["package_title"]).lower())
+
+    return {
+        "questions": questions,
+        "papers": papers,
+        "additions": additions,
+        "package_links": package_links,
+        "academic_breakdown": academic_breakdown,
+        "question_breakdown": {
+            "by_type": [{"label": k, "count": v} for k, v in sorted(by_type.items(), key=lambda x: (-x[1], x[0]))],
+            "by_exam": [{"label": k, "count": v} for k, v in sorted(by_exam.items(), key=lambda x: (-x[1], x[0]))],
+            "by_subject": [{"label": k, "count": v} for k, v in sorted(by_subject.items(), key=lambda x: (-x[1], x[0]))],
+            "by_chapter": [{"label": k, "count": v} for k, v in sorted(by_chapter.items(), key=lambda x: (-x[1], x[0]))],
+            "by_topic": [{"label": k, "count": v} for k, v in sorted(by_topic.items(), key=lambda x: (-x[1], x[0]))],
+        },
+        "package_contributions": package_contributions_list,
+    }
 
 
 # -----------------------------------------------------------------------------
@@ -820,17 +1035,8 @@ async def progress_dashboard(
     }
 
 
-@router.get("/report/member/{user_id}")
-async def member_progress_report(
-    user_id: int,
-    period: str = Query(default="3m"),
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db),
-):
-    await require_super_admin(current_user)
-    period = period.strip().lower()
+async def build_member_report(db: AsyncSession, user_id: int, period: str) -> Dict[str, Any]:
     start = period_start(period)
-
     member = await one(
         db,
         """
@@ -849,37 +1055,29 @@ async def member_progress_report(
     if target is None:
         raise HTTPException(404, "Staff activity not found.")
 
-    details = await get_member_details(db, user_id)
-    qrows = details["questions"]
-    papers = details["papers"]
+    details = await get_member_details(db, user_id, start)
+    qrows_period = details["questions"]
+    papers_period = details["papers"]
     additions = details["additions"]
     links = details["package_links"]
 
-    # Detailed question/paper records are lifetime records, so provide both the
-    # complete list and an explicit period-filtered subset where timestamps exist.
-    if start is not None:
-        qrows_period = [r for r in qrows if (to_datetime(r.get("created_at")) or datetime.min) >= start]
-        papers_period = [r for r in papers if (to_datetime(r.get("created_at")) or datetime.min) >= start]
-    else:
-        qrows_period = qrows
-        papers_period = papers
+    # Relationship metrics are deliberately lifetime/current because their
+    # source tables have no creation timestamp.
+    summary = {
+        "questions_created": len(qrows_period),
+        "topics_created": target["topics_created"],
+        "chapters_created": target["chapters_created"],
+        "subjects_created": target["subjects_created"],
+        "papers_assembled": len(papers_period),
+        "questions_added_to_papers": len(additions),
+        "package_paper_links": len(links),
+        "packages_linked": target["packages_linked"],
+    }
 
     return {
         "period": period_meta(period, start),
-        "member": {
-            **{k: v for k, v in target.items()},
-            "created_at": iso(target.get("created_at")),
-        },
-        "summary": {
-            "questions_created": len(qrows_period),
-            "topics_created": target["topics_created"],
-            "chapters_created": target["chapters_created"],
-            "subjects_created": target["subjects_created"],
-            "papers_assembled": len(papers_period),
-            "questions_added_to_papers": len(additions),
-            "package_paper_links": len(links),
-            "packages_linked": target["packages_linked"],
-        },
+        "member": {**target, "created_at": iso(target.get("created_at"))},
+        "summary": summary,
         "questions": [
             {
                 "question_id": int(r["question_id"]),
@@ -894,13 +1092,9 @@ async def member_progress_report(
         ],
         "papers": [
             {
-                "id": int(r["id"]),
-                "title": r["title"],
-                "exam_id": r.get("exam_id"),
-                "exam_title": r.get("exam_title"),
-                "exam_code": r.get("exam_code"),
-                "duration_minutes": r.get("duration_minutes"),
-                "total_marks": r.get("total_marks"),
+                "id": int(r["id"]), "title": r["title"], "exam_id": r.get("exam_id"),
+                "exam_title": r.get("exam_title"), "exam_code": r.get("exam_code"),
+                "duration_minutes": r.get("duration_minutes"), "total_marks": r.get("total_marks"),
                 "total_questions": int(r.get("total_questions") or 0),
                 "questions_added_by_me": int(r.get("questions_added_by_me") or 0),
                 "created_at": iso(r.get("created_at")),
@@ -909,13 +1103,9 @@ async def member_progress_report(
         ],
         "collaborative_paper_additions": [
             {
-                "test_question_id": int(r["test_question_id"]),
-                "test_id": int(r["test_id"]),
-                "test_title": r.get("test_title"),
-                "question_id": int(r["question_id"]),
-                "order": r.get("order"),
-                "marks": r.get("marks"),
-                "negative_marks": r.get("negative_marks"),
+                "test_question_id": int(r["test_question_id"]), "test_id": int(r["test_id"]),
+                "test_title": r.get("test_title"), "question_id": int(r["question_id"]),
+                "order": r.get("order"), "marks": r.get("marks"), "negative_marks": r.get("negative_marks"),
                 "topic": {"id": int(r["topic_id"]), "name": r["topic_name"]},
                 "chapter": {"id": int(r["chapter_id"]), "name": r["chapter_name"]},
                 "subject": {"id": int(r["subject_id"]), "name": r["subject_name"]},
@@ -925,24 +1115,299 @@ async def member_progress_report(
         ],
         "package_links": [
             {
-                "package_id": int(r["package_id"]),
-                "package_title": r.get("package_title"),
-                "test_id": int(r["test_id"]),
-                "test_title": r.get("test_title"),
-                "exam_id": r.get("package_exam_id"),
-                "created_by": user_id,
+                "package_id": int(r["package_id"]), "package_title": r.get("package_title"),
+                "test_id": int(r["test_id"]), "test_title": r.get("test_title"),
+                "exam_id": r.get("package_exam_id"), "created_by": user_id,
                 "period_filter_applied": False,
             }
             for r in links
         ],
+        "academic_breakdown": details["academic_breakdown"],
+        "question_breakdown": details["question_breakdown"],
+        "package_contributions": details["package_contributions"],
         "scope": {
             "questions_and_papers": "period" if start else "all",
             "test_question_additions": "lifetime",
             "package_test_links": "lifetime",
+            "note": "Questions and papers use created_at. Test-question additions and package-test links are lifetime/current because those relationship tables do not expose a creation timestamp.",
         },
         "team_totals": totals,
         "generated_at": datetime.utcnow().isoformat(),
     }
+
+
+@router.get("/report/member/{user_id}")
+async def member_progress_report(
+    user_id: int,
+    period: str = Query(default="3m"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await require_super_admin(current_user)
+    period = period.strip().lower()
+    return await build_member_report(db, user_id, period)
+
+
+# -----------------------------------------------------------------------------
+# Official PDF report generation
+# -----------------------------------------------------------------------------
+
+
+def _pdf_text(value: Any) -> str:
+    text_value = "" if value is None else str(value)
+    return (text_value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def _pdf_styles():
+    styles = getSampleStyleSheet()
+    return {
+        "title": ParagraphStyle("AccTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=18, leading=22, textColor=colors.HexColor("#16293F"), spaceAfter=4),
+        "subtitle": ParagraphStyle("AccSubtitle", parent=styles["Normal"], fontName="Helvetica", fontSize=8.5, leading=12, textColor=colors.HexColor("#667085"), spaceAfter=2),
+        "section": ParagraphStyle("AccSection", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=11.5, leading=14, textColor=colors.HexColor("#16293F"), spaceBefore=8, spaceAfter=6),
+        "body": ParagraphStyle("AccBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=8.5, leading=12, textColor=colors.HexColor("#344054")),
+        "small": ParagraphStyle("AccSmall", parent=styles["BodyText"], fontName="Helvetica", fontSize=7.2, leading=9.5, textColor=colors.HexColor("#667085")),
+        "tiny": ParagraphStyle("AccTiny", parent=styles["BodyText"], fontName="Helvetica", fontSize=6.5, leading=8, textColor=colors.HexColor("#667085")),
+        "metric": ParagraphStyle("AccMetric", parent=styles["BodyText"], fontName="Helvetica-Bold", fontSize=14, leading=16, textColor=colors.HexColor("#1F3A5C"), alignment=TA_CENTER),
+        "metric_label": ParagraphStyle("AccMetricLabel", parent=styles["BodyText"], fontName="Helvetica-Bold", fontSize=6.5, leading=8, textColor=colors.HexColor("#667085"), alignment=TA_CENTER),
+        "right": ParagraphStyle("AccRight", parent=styles["BodyText"], fontName="Helvetica", fontSize=7.5, leading=9, textColor=colors.HexColor("#667085"), alignment=TA_RIGHT),
+    }
+
+
+PDF_CONTENT_WIDTH = 182 * mm  # A4 width (210mm) - 14mm left/right margins
+
+
+def _fit_pdf_widths(widths: Optional[List[float]]) -> Optional[List[float]]:
+    """Keep every ReportLab table inside the A4 content frame.
+
+    ReportLab does not automatically shrink an explicitly supplied colWidths.
+    A few of the report tables contain long text and previously exceeded the
+    182mm portrait content width, which caused the rightmost columns to be
+    clipped.  Scale oversized width lists proportionally while preserving the
+    requested column ratios.
+    """
+    if not widths:
+        return widths
+    total = sum(widths)
+    if total <= PDF_CONTENT_WIDTH:
+        return widths
+    scale = PDF_CONTENT_WIDTH / total
+    return [w * scale for w in widths]
+
+
+def _pdf_table(data: List[List[Any]], widths: Optional[List[float]] = None, header: bool = True, font_size: float = 7.2):
+    widths = _fit_pdf_widths(widths)
+    converted = []
+    for row in data:
+        converted.append([x if isinstance(x, Paragraph) else Paragraph(_pdf_text(x), ParagraphStyle("cell", fontName="Helvetica", fontSize=font_size, leading=font_size+2, textColor=colors.HexColor("#344054"))) for x in row])
+    table = Table(converted, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
+    style = [
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#E4E7EC")),
+    ]
+    if header and converted:
+        style += [
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#F2F4F7")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#344054")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ]
+    table.setStyle(TableStyle(style))
+    return table
+
+
+class _AccqudoPDF(BaseDocTemplate):
+    def __init__(self, buffer, member_name: str, period_label: str, generated_at: str):
+        super().__init__(buffer, pagesize=A4, rightMargin=14*mm, leftMargin=14*mm, topMargin=32*mm, bottomMargin=17*mm, title=f"Accqudo Staff Contribution Report - {member_name}")
+        frame = Frame(self.leftMargin, self.bottomMargin, self.width, self.height, id="normal")
+        self.addPageTemplates([PageTemplate(id="accqudo", frames=[frame], onPage=self._draw_header_footer)])
+        self.member_name = member_name
+        self.period_label = period_label
+        self.generated_at = generated_at
+
+    def _draw_header_footer(self, canvas, doc):
+        canvas.saveState()
+        width, height = A4
+        navy = colors.HexColor("#16293F")
+        blue = colors.HexColor("#1F3A5C")
+        muted = colors.HexColor("#667085")
+        canvas.setFillColor(navy)
+        canvas.setFont("Helvetica-Bold", 17)
+        canvas.drawString(14*mm, height-15*mm, "ACCQUDO")
+        canvas.setFillColor(blue)
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.drawString(14*mm, height-20*mm, "EDUCATION • PRACTICE • PERFORMANCE")
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawRightString(width-14*mm, height-15*mm, "INTERNAL CONTRIBUTION REPORT")
+        canvas.line(14*mm, height-23*mm, width-14*mm, height-23*mm)
+
+        canvas.setStrokeColor(colors.HexColor("#E4E7EC"))
+        canvas.line(14*mm, 12*mm, width-14*mm, 12*mm)
+        canvas.setFillColor(muted)
+        canvas.setFont("Helvetica", 6.5)
+        canvas.drawString(14*mm, 7.5*mm, "Accqudo • accqudo.com • Confidential internal document")
+        canvas.drawRightString(width-14*mm, 7.5*mm, f"Page {doc.page}")
+        canvas.restoreState()
+
+
+def build_member_pdf(report: Dict[str, Any]) -> io.BytesIO:
+    buffer = io.BytesIO()
+    member = report["member"]
+    period = report["period"]
+    styles = _pdf_styles()
+    doc = _AccqudoPDF(
+        buffer,
+        str(member.get("full_name") or member.get("email") or f"Staff {member.get('id')}"),
+        str(period["label"]),
+        str(report.get("generated_at") or ""),
+    )
+    story: List[Any] = []
+
+    story.append(Paragraph("STAFF CONTRIBUTION & PERFORMANCE REPORT", styles["title"]))
+    story.append(Paragraph("Official internal report of attributable academic-content and paper-building activity.", styles["subtitle"]))
+    story.append(Spacer(1, 4))
+
+    identity = [
+        [Paragraph("STAFF MEMBER", styles["metric_label"]), Paragraph("ROLE", styles["metric_label"]), Paragraph("REPORT PERIOD", styles["metric_label"]), Paragraph("GENERATED", styles["metric_label"])],
+        [Paragraph(_pdf_text(member.get("full_name") or "Unnamed staff"), styles["body"]), Paragraph(_pdf_text(role_label(member.get("role"))), styles["body"]), Paragraph(_pdf_text(period["label"]), styles["body"]), Paragraph(_pdf_text(iso(report.get("generated_at"))), styles["body"])],
+        [Paragraph("EMAIL", styles["metric_label"]), Paragraph("STAFF ID", styles["metric_label"]), Paragraph("PERIOD START", styles["metric_label"]), Paragraph("PERIOD END", styles["metric_label"])],
+        [Paragraph(_pdf_text(member.get("email")), styles["body"]), Paragraph(str(member.get("id")), styles["body"]), Paragraph(_pdf_text(iso(period.get("start_date")) or "Full history"), styles["body"]), Paragraph(_pdf_text(iso(period.get("end_date"))), styles["body"])],
+    ]
+    story.append(_pdf_table(identity, widths=[43*mm, 33*mm, 47*mm, 47*mm], header=False))
+    story.append(Spacer(1, 8))
+
+    summary = report["summary"]
+    metric_rows = [[
+        Paragraph("QUESTIONS", styles["metric_label"]), Paragraph("PAPERS", styles["metric_label"]), Paragraph("PAPER ADDITIONS", styles["metric_label"]), Paragraph("PACKAGE LINKS", styles["metric_label"]), Paragraph("PACKAGES", styles["metric_label"]),
+    ], [
+        Paragraph(str(summary["questions_created"]), styles["metric"]), Paragraph(str(summary["papers_assembled"]), styles["metric"]), Paragraph(str(summary["questions_added_to_papers"]), styles["metric"]), Paragraph(str(summary["package_paper_links"]), styles["metric"]), Paragraph(str(summary["packages_linked"]), styles["metric"]),
+    ]]
+    story.append(_pdf_table(metric_rows, widths=[35.2*mm]*5, header=False))
+    story.append(Spacer(1, 7))
+
+    story.append(Paragraph("1. Contribution overview", styles["section"]))
+    story.append(Paragraph(
+        f"This report covers <b>{_pdf_text(period['label'])}</b>. Question and paper creation are filtered using their database creation timestamps. Paper-question additions and package-paper links are shown as lifetime/current attribution because the underlying relationship tables do not contain a reliable creation timestamp.",
+        styles["body"],
+    ))
+
+    qb = report["question_breakdown"]
+    for title, key in [("Question types", "by_type"), ("Exams", "by_exam"), ("Subjects", "by_subject")]:
+        items = qb.get(key, [])
+        if items:
+            story.append(Paragraph(title, styles["section"]))
+            rows_data = [["Category", "Questions", "Share"]]
+            total = sum(int(x["count"]) for x in items)
+            for item in items:
+                count = int(item["count"])
+                share = (100 * count / total) if total else 0
+                rows_data.append([item["label"], count, f"{share:.1f}%"])
+            story.append(_pdf_table(rows_data, widths=[105*mm, 35*mm, 25*mm]))
+
+    story.append(Paragraph("2. Academic contribution by section", styles["section"]))
+    academic = report.get("academic_breakdown", [])
+    if not academic:
+        story.append(Paragraph("No authored questions were found for the selected period.", styles["body"]))
+    else:
+        for exam in academic:
+            story.append(KeepTogether([Paragraph(f"Exam: {_pdf_text(exam.get('title'))}", styles["body"]), Spacer(1, 2)]))
+            rows_data = [["Subject", "Chapter", "Topic", "Contributed", "Topic total", "Share"]]
+            for subject in exam.get("subjects", []):
+                for chapter in subject.get("chapters", []):
+                    for topic in chapter.get("topics", []):
+                        rows_data.append([
+                            subject.get("name"), chapter.get("name"), topic.get("name"),
+                            topic.get("contributed_questions", 0), topic.get("total_questions", 0),
+                            f"{float(topic.get('contribution_percent', 0)):.1f}%",
+                        ])
+            story.append(_pdf_table(rows_data, widths=[35*mm, 43*mm, 48*mm, 19*mm, 19*mm, 18*mm], font_size=6.4))
+            story.append(Spacer(1, 5))
+
+    story.append(Paragraph("3. Papers assembled", styles["section"]))
+    papers = report.get("papers", [])
+    if papers:
+        rows_data = [["Paper", "Exam", "Questions", "Added by member", "Marks", "Created"]]
+        for p in papers:
+            rows_data.append([
+                p.get("title") or f"Paper #{p.get('id')}", p.get("exam_title") or "—",
+                p.get("total_questions", 0), p.get("questions_added_by_me", 0),
+                p.get("total_marks") if p.get("total_marks") is not None else "—", iso(p.get("created_at")) or "—",
+            ])
+        story.append(_pdf_table(rows_data, widths=[52*mm, 38*mm, 20*mm, 28*mm, 20*mm, 29*mm], font_size=6.6))
+    else:
+        story.append(Paragraph("No papers assembled in the selected period.", styles["body"]))
+
+    story.append(Paragraph("4. Collaborative paper additions", styles["section"]))
+    additions = report.get("collaborative_paper_additions", [])
+    if additions:
+        rows_data = [["Paper", "Question", "Subject", "Chapter", "Topic", "Marks"]]
+        for a in additions:
+            rows_data.append([
+                a.get("test_title") or f"Paper #{a.get('test_id')}", f"#{a.get('question_id')}",
+                a.get("subject", {}).get("name"), a.get("chapter", {}).get("name"), a.get("topic", {}).get("name"),
+                a.get("marks") if a.get("marks") is not None else "—",
+            ])
+        story.append(_pdf_table(rows_data, widths=[45*mm, 18*mm, 32*mm, 39*mm, 42*mm, 16*mm], font_size=6.2))
+    else:
+        story.append(Paragraph("No collaborative paper additions found.", styles["body"]))
+
+    story.append(Paragraph("5. Package contribution", styles["section"]))
+    package_items = report.get("package_contributions", [])
+    if package_items:
+        rows_data = [["Package", "Paper ID", "Total questions", "Member questions", "Contribution"]]
+        for package in package_items:
+            for paper in package.get("papers", []):
+                rows_data.append([
+                    package.get("package_title") or f"Package #{package.get('package_id')}",
+                    paper.get("test_id"), paper.get("total_questions", 0), paper.get("contributed_questions", 0),
+                    f"{float(paper.get('contribution_percent', 0)):.1f}%",
+                ])
+        story.append(_pdf_table(rows_data, widths=[70*mm, 25*mm, 32*mm, 32*mm, 30*mm]))
+    else:
+        story.append(Paragraph("No package contribution links were attributed to this member.", styles["body"]))
+
+    story.append(Paragraph("6. Package ↔ paper links created by member", styles["section"]))
+    links = report.get("package_links", [])
+    if links:
+        rows_data = [["Package", "Package ID", "Paper", "Paper ID"]]
+        for link in links:
+            rows_data.append([
+                link.get("package_title") or f"Package #{link.get('package_id')}", link.get("package_id"),
+                link.get("test_title") or f"Paper #{link.get('test_id')}", link.get("test_id"),
+            ])
+        story.append(_pdf_table(rows_data, widths=[75*mm, 25*mm, 75*mm, 25*mm]))
+    else:
+        story.append(Paragraph("No package ↔ paper links found.", styles["body"]))
+
+    # Full authored-question appendix: this makes the report auditable rather
+    # than merely a KPI summary.
+    story.append(PageBreak())
+    story.append(Paragraph("APPENDIX A — COMPLETE AUTHORED QUESTION REGISTER", styles["title"]))
+    story.append(Paragraph("Every question attributed to the selected staff member in the report period.", styles["subtitle"]))
+    qrows = [["Question ID", "Type", "Exam", "Subject", "Chapter", "Topic", "Created"]]
+    for q in report.get("questions", []):
+        qrows.append([
+            q.get("question_id"), q.get("question_type") or "—", q.get("exam", {}).get("title") or "—",
+            q.get("subject", {}).get("name") or "—", q.get("chapter", {}).get("name") or "—",
+            q.get("topic", {}).get("name") or "—", iso(q.get("created_at")) or "—",
+        ])
+    if len(qrows) == 1:
+        qrows.append(["—", "—", "No questions", "—", "—", "—", "—"])
+    story.append(_pdf_table(qrows, widths=[17*mm, 21*mm, 37*mm, 34*mm, 39*mm, 39*mm, 28*mm], font_size=5.8))
+
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Report control note", styles["section"]))
+    story.append(Paragraph(
+        "This document is generated directly from Accqudo application data and is intended for internal administrative review. Attribution is based on the database ownership fields used by the Team Contribution system. Counts should be interpreted within the selected reporting period and the timestamp limitations stated above.",
+        styles["small"],
+    ))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
 
 
 @router.get("/report/member/{user_id}/download")
@@ -954,51 +1419,49 @@ async def download_member_report(
 ):
     await require_super_admin(current_user)
     period = period.strip().lower()
-    start = period_start(period)
-    member = await one(
-        db,
-        "SELECT id, full_name, email, role FROM users WHERE id=:uid AND UPPER(role) IN ('ADMIN','TEAM','SUPER_ADMIN','SUPERADMIN')",
-        {"uid": user_id},
+    report = await build_member_report(db, user_id, period)
+    pdf = build_member_pdf(report)
+    member_name = str(report["member"].get("full_name") or f"staff_{user_id}").strip()
+    safe_name = "_".join(part for part in member_name.replace("/", "_").split() if part) or f"staff_{user_id}"
+    filename = f"accqudo_{safe_name}_{period}_staff_contribution_report.pdf"
+    return StreamingResponse(
+        pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    if not member:
-        raise HTTPException(404, "Staff member not found.")
 
-    staff = await get_staff_activity(db, start)
-    target = next((x for x in staff if int(x["id"]) == user_id), None)
-    if target is None:
-        raise HTTPException(404, "Staff activity not found.")
 
+@router.get("/report/member/{user_id}/download/csv")
+async def download_member_csv(
+    user_id: int,
+    period: str = Query(default="3m"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await require_super_admin(current_user)
+    period = period.strip().lower()
+    report = await build_member_report(db, user_id, period)
     headers = [
-        "staff_id", "full_name", "email", "role", "period",
-        "questions_created", "topics_created", "chapters_created", "subjects_created",
-        "papers_assembled", "questions_added_to_papers", "package_paper_links", "packages_linked",
-        "question_share_percent", "paper_share_percent", "attribution_scope",
+        "staff_id", "full_name", "email", "role", "period", "questions_created", "topics_created",
+        "chapters_created", "subjects_created", "papers_assembled", "questions_added_to_papers",
+        "package_paper_links", "packages_linked", "question_share_percent", "paper_share_percent",
+        "question_addition_share_percent", "package_link_share_percent", "attribution_scope",
     ]
+    member = report["member"]
+    target = member
+    totals = report["team_totals"]
     record = {
-        "staff_id": user_id,
-        "full_name": member["full_name"],
-        "email": member["email"],
-        "role": member["role"],
-        "period": period,
-        "questions_created": target["questions_created"],
-        "topics_created": target["topics_created"],
-        "chapters_created": target["chapters_created"],
-        "subjects_created": target["subjects_created"],
-        "papers_assembled": target["papers_assembled"],
-        "questions_added_to_papers": target["questions_added_to_papers"],
-        "package_paper_links": target["package_paper_links"],
-        "packages_linked": target["packages_linked"],
-        "question_share_percent": target.get("question_share_percent", 0),
-        "paper_share_percent": target.get("paper_share_percent", 0),
-        "attribution_scope": "created_by/added_by period metrics + lifetime relationship metrics",
+        "staff_id": user_id, "full_name": member.get("full_name"), "email": member.get("email"),
+        "role": member.get("role"), "period": period, **report["summary"],
+        "question_share_percent": round(100 * report["summary"]["questions_created"] / totals["questions_created"], 1) if totals["questions_created"] else 0,
+        "paper_share_percent": round(100 * report["summary"]["papers_assembled"] / totals["papers_assembled"], 1) if totals["papers_assembled"] else 0,
+        "question_addition_share_percent": round(100 * report["summary"]["questions_added_to_papers"] / totals["questions_added_to_papers"], 1) if totals["questions_added_to_papers"] else 0,
+        "package_link_share_percent": round(100 * report["summary"]["package_paper_links"] / totals["package_paper_links"], 1) if totals["package_paper_links"] else 0,
+        "attribution_scope": report["scope"]["note"],
     }
     data = build_csv(headers, [record])
-    name = str(member["full_name"] or f"staff_{user_id}").strip().replace(" ", "_").replace("/", "_")
-    return StreamingResponse(
-        data,
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": f'attachment; filename="accqudo_{name}_{period}_progress.csv"'},
-    )
+    name = str(member.get("full_name") or f"staff_{user_id}").strip().replace(" ", "_").replace("/", "_")
+    return StreamingResponse(data, media_type="text/csv; charset=utf-8", headers={"Content-Disposition": f'attachment; filename="accqudo_{name}_{period}_progress.csv"'})
 
 
 async def complete_sales_rows(db: AsyncSession, start: Optional[datetime], source: str) -> List[Dict[str, Any]]:
