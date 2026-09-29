@@ -13,7 +13,7 @@ from app.api.v1.endpoints import (
     
 )
 
-from app.api.v1.team.contribution import contribution
+from app.api.v1.team import contribution
 from app.api.v1.team.progress import router as team_progress_router
 
 api_router = APIRouter()
