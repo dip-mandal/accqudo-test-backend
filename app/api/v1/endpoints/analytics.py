@@ -221,11 +221,13 @@ async def get_my_dashboard(
         package_col = columns.get("package_id")
         test_col = columns.get("test_id")
 
-        status_col = (
-            columns.get("status")
-            or columns.get("payment_status")
-            or columns.get("order_status")
-        )
+        # SQLAlchemy Column objects cannot be evaluated as booleans.
+        # Therefore, do not use Python "or" between columns.
+        status_col = columns.get("status")
+        if status_col is None:
+            status_col = columns.get("payment_status")
+        if status_col is None:
+            status_col = columns.get("order_status")
 
         if user_col is None:
             return
@@ -334,11 +336,13 @@ async def get_my_dashboard(
                 selected_columns.append(status_col)
 
             # Support common expiry column names without requiring them.
-            expiry_col = (
-                columns.get("expiry_date")
-                or columns.get("expires_at")
-                or columns.get("end_date")
-            )
+            # SQLAlchemy Column objects cannot be evaluated as booleans.
+            # Resolve the first available expiry column explicitly.
+            expiry_col = columns.get("expiry_date")
+            if expiry_col is None:
+                expiry_col = columns.get("expires_at")
+            if expiry_col is None:
+                expiry_col = columns.get("end_date")
 
             if expiry_col is not None:
                 selected_columns.append(expiry_col)
