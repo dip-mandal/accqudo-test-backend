@@ -8,7 +8,10 @@ from app.core.database import get_db, Base
 from app.core.security import get_current_user
 from app.models.attempt import TestAttempt
 from app.models.enrollment import TestEnrollment
-from app.models.test import Test
+from app.models.test import Test, TestQuestion
+from app.models.exam import Exam, Subject, Chapter, Topic
+from app.models.question import Question
+from app.models.package import SubscriptionPackage, package_tests_table
 from app.models.user import User
 from app.services.analytics_service import AnalyticsService
 from app.services.leaderboard_service import LeaderboardService
@@ -452,6 +455,234 @@ async def get_my_dashboard(
     catalog_res = await db.execute(catalog_stmt)
     all_tests = catalog_res.scalars().all()
 
+    # -------------------------------------------------------------------------
+    # 6A. Build the real academic hierarchy for every test:
+    # Exam Stream -> Subject -> Chapter -> Topic -> Test
+    #
+    # A test is classified from the topics of its real test questions. A test
+    # may legitimately occur under multiple topics/chapters/subjects.
+    # -------------------------------------------------------------------------
+    test_ids = [int(t.id) for t in all_tests]
+
+    taxonomy_by_test: dict[int, list[dict]] = {}
+    exam_by_test: dict[int, dict] = {}
+
+    if test_ids:
+        exam_rows = (
+            await db.execute(
+                select(
+                    Test.id,
+                    Exam.id,
+                    Exam.title,
+                    Exam.code,
+                )
+                .join(Exam, Exam.id == Test.exam_id)
+                .where(Test.id.in_(test_ids))
+            )
+        ).all()
+
+        for test_id, exam_id, exam_title, exam_code in exam_rows:
+            exam_by_test[int(test_id)] = {
+                "id": int(exam_id),
+                "title": exam_title,
+                "code": exam_code,
+            }
+
+        taxonomy_stmt = (
+            select(
+                TestQuestion.test_id,
+                Exam.id.label("exam_id"),
+                Exam.title.label("exam_title"),
+                Exam.code.label("exam_code"),
+                Subject.id.label("subject_id"),
+                Subject.name.label("subject_name"),
+                Chapter.id.label("chapter_id"),
+                Chapter.name.label("chapter_name"),
+                Topic.id.label("topic_id"),
+                Topic.name.label("topic_name"),
+            )
+            .join(Question, Question.id == TestQuestion.question_id)
+            .join(Topic, Topic.id == Question.topic_id)
+            .join(Chapter, Chapter.id == Topic.chapter_id)
+            .join(Subject, Subject.id == Chapter.subject_id)
+            .join(Exam, Exam.id == Subject.exam_id)
+            .where(TestQuestion.test_id.in_(test_ids))
+        )
+
+        taxonomy_rows = (await db.execute(taxonomy_stmt)).all()
+
+        seen_paths: set[tuple] = set()
+        for row in taxonomy_rows:
+            (
+                test_id,
+                exam_id,
+                exam_title,
+                exam_code,
+                subject_id,
+                subject_name,
+                chapter_id,
+                chapter_name,
+                topic_id,
+                topic_name,
+            ) = row
+
+            key = (
+                int(test_id),
+                int(subject_id),
+                int(chapter_id),
+                int(topic_id),
+            )
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+
+            taxonomy_by_test.setdefault(int(test_id), []).append(
+                {
+                    "exam_stream": {
+                        "id": int(exam_id),
+                        "title": exam_title,
+                        "code": exam_code,
+                    },
+                    "subject": {
+                        "id": int(subject_id),
+                        "name": subject_name,
+                    },
+                    "chapter": {
+                        "id": int(chapter_id),
+                        "name": chapter_name,
+                    },
+                    "topic": {
+                        "id": int(topic_id),
+                        "name": topic_name,
+                    },
+                }
+            )
+
+    # -------------------------------------------------------------------------
+    # 6B. Resolve purchased package -> tests and package metadata.
+    # -------------------------------------------------------------------------
+    package_by_test: dict[int, list[dict]] = {}
+
+    if purchased_package_ids:
+        package_rows = (
+            await db.execute(
+                select(
+                    SubscriptionPackage.id,
+                    SubscriptionPackage.exam_id,
+                    SubscriptionPackage.title,
+                    Exam.title.label("exam_title"),
+                    Exam.code.label("exam_code"),
+                )
+                .join(Exam, Exam.id == SubscriptionPackage.exam_id)
+                .where(
+                    SubscriptionPackage.id.in_(purchased_package_ids)
+                )
+            )
+        ).all()
+
+        package_meta = {
+            int(row.id): {
+                "id": int(row.id),
+                "title": row.title,
+                "exam_stream": {
+                    "id": int(row.exam_id),
+                    "title": row.exam_title,
+                    "code": row.exam_code,
+                },
+            }
+            for row in package_rows
+        }
+
+        if package_meta:
+            pt_rows = (
+                await db.execute(
+                    select(
+                        package_tests_table.c.package_id,
+                        package_tests_table.c.test_id,
+                    ).where(
+                        package_tests_table.c.package_id.in_(
+                            set(package_meta.keys())
+                        )
+                    )
+                )
+            ).all()
+
+            for package_id, test_id in pt_rows:
+                if test_id is None:
+                    continue
+                meta = package_meta.get(int(package_id))
+                if meta is not None:
+                    package_by_test.setdefault(int(test_id), []).append(meta)
+
+    def build_classification(test_id: int) -> dict:
+        paths = taxonomy_by_test.get(test_id, [])
+        exam = exam_by_test.get(test_id)
+
+        # Prefer the academic hierarchy from the actual questions. If a test
+        # has no questions yet, fall back to the Test.exam_id relation only.
+        subjects_map: dict[int, dict] = {}
+
+        for path in paths:
+            subject = path["subject"]
+            chapter = path["chapter"]
+            topic = path["topic"]
+
+            subject_node = subjects_map.setdefault(
+                int(subject["id"]),
+                {
+                    "id": int(subject["id"]),
+                    "name": subject["name"],
+                    "chapters": {},
+                },
+            )
+
+            chapter_node = subject_node["chapters"].setdefault(
+                int(chapter["id"]),
+                {
+                    "id": int(chapter["id"]),
+                    "name": chapter["name"],
+                    "topics": {},
+                },
+            )
+
+            chapter_node["topics"][int(topic["id"])] = {
+                "id": int(topic["id"]),
+                "name": topic["name"],
+            }
+
+        subjects = []
+        for subject in subjects_map.values():
+            chapters = []
+            for chapter in subject["chapters"].values():
+                chapters.append(
+                    {
+                        "id": chapter["id"],
+                        "name": chapter["name"],
+                        "topics": list(chapter["topics"].values()),
+                    }
+                )
+            subjects.append(
+                {
+                    "id": subject["id"],
+                    "name": subject["name"],
+                    "chapters": chapters,
+                }
+            )
+
+        packages = package_by_test.get(test_id, [])
+
+        return {
+            "exam_stream": exam,
+            "packages": packages,
+            "subjects": subjects,
+            "has_topic_classification": bool(subjects),
+        }
+
+    classifications = {
+        int(test.id): build_classification(int(test.id))
+        for test in all_tests
+    }
+
     enrolled_tests = []
     store_catalog = []
 
@@ -475,12 +706,33 @@ async def get_my_dashboard(
                 None,
             ),
             "is_enrolled": test_id in enrolled_ids,
+            "classification": classifications.get(
+                test_id,
+                {
+                    "exam_stream": None,
+                    "packages": [],
+                    "subjects": [],
+                    "has_topic_classification": False,
+                },
+            ),
         }
 
         if test_id in enrolled_ids:
             enrolled_tests.append(item)
         else:
             store_catalog.append(item)
+
+    # Attach the same real hierarchy to every attempt record.
+    for history_item in history:
+        history_item["classification"] = classifications.get(
+            int(history_item["test_id"]),
+            {
+                "exam_stream": None,
+                "packages": [],
+                "subjects": [],
+                "has_topic_classification": False,
+            },
+        )
 
     # -------------------------------------------------------------------------
     # 8. Return database-backed dashboard data
