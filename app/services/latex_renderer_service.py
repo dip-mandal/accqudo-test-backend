@@ -308,7 +308,12 @@ class LatexRendererService:
 
         tex_path = work_dir / "document.tex"
         pdf_path = work_dir / "document.pdf"
-        svg_prefix = work_dir / "document"
+
+        # Exact SVG filename.
+        svg_path = work_dir / "document.svg"
+
+        # Output path used by pdftocairo.
+        svg_output = svg_path
 
         # --------------------------------------------------------------
         # Build controlled TeX document.
@@ -361,7 +366,7 @@ class LatexRendererService:
         svg_path = await cls._convert_pdf_to_svg(
             work_dir=work_dir,
             pdf_path=pdf_path,
-            svg_prefix=svg_prefix,
+            svg_path=svg_output,
         )
 
         # --------------------------------------------------------------
@@ -579,8 +584,24 @@ class LatexRendererService:
         cls,
         work_dir: Path,
         pdf_path: Path,
-        svg_prefix: Path,
+        svg_path: Path,
     ) -> Path:
+        """
+        Convert the first page of a PDF to SVG.
+
+        IMPORTANT:
+
+        pdftocairo's -singlefile option is NOT valid for SVG output.
+
+        Instead of supplying an output prefix and relying on Poppler's
+        filename generation behavior, we provide the exact output SVG
+        filename:
+
+            document.svg
+
+        This avoids the filename mismatch that caused the previous
+        "completed without producing an SVG" error.
+        """
 
         command = [
             cls.PDF_TO_SVG_BINARY,
@@ -598,27 +619,22 @@ class LatexRendererService:
             "-f",
             "1",
 
+            "-l",
+            "1",
+
             # ----------------------------------------------------------
-            # IMPORTANT:
-            #
-            # Do NOT use "-singlefile" here.
-            #
-            # pdftocairo supports "-singlefile" only with raster
-            # output formats such as PNG/JPEG/TIFF. It is invalid
-            # when "-svg" is selected.
-            #
-            # With SVG output, pdftocairo automatically creates:
-            #
-            #     document.svg
-            #
-            # from the output prefix:
-            #
-            #     document
+            # Input PDF.
             # ----------------------------------------------------------
 
             str(pdf_path),
 
-            str(svg_prefix),
+            # ----------------------------------------------------------
+            # EXACT output SVG filename.
+            #
+            # Do not use "-singlefile".
+            # ----------------------------------------------------------
+
+            str(svg_path),
         ]
 
         try:
@@ -671,18 +687,61 @@ class LatexRendererService:
                 f"PDF to SVG conversion failed: {detail}"
             )
 
-        # pdftocairo -svg <pdf> <prefix>
-        # creates <prefix>.svg
-        svg_path = Path(
-            f"{svg_prefix}.svg"
+        # --------------------------------------------------------------
+        # Primary expected output.
+        # --------------------------------------------------------------
+
+        if svg_path.exists() and svg_path.is_file():
+            return svg_path
+
+        # --------------------------------------------------------------
+        # Fallback:
+        #
+        # Some Poppler versions may still generate a page-suffixed
+        # filename. Search the isolated temporary directory for SVG
+        # files before declaring failure.
+        # --------------------------------------------------------------
+
+        generated_svgs = sorted(
+            path
+            for path in work_dir.glob("*.svg")
+            if path.is_file()
         )
 
-        if not svg_path.exists():
-            raise LatexConversionError(
-                "pdftocairo completed without producing an SVG."
-            )
+        if len(generated_svgs) == 1:
+            return generated_svgs[0]
 
-        return svg_path
+        if generated_svgs:
+            # Prefer the requested filename if present.
+            for generated_svg in generated_svgs:
+                if generated_svg.name == svg_path.name:
+                    return generated_svg
+
+            # Otherwise use the first generated SVG.
+            return generated_svgs[0]
+
+        # --------------------------------------------------------------
+        # No SVG was generated.
+        #
+        # Keep diagnostics internal. The API layer will expose only
+        # the friendly conversion error to the frontend.
+        # --------------------------------------------------------------
+
+        directory_contents = sorted(
+            path.name
+            for path in work_dir.iterdir()
+        )
+
+        diagnostics = (
+            "pdftocairo completed without producing an SVG. "
+            f"stdout={stdout_text[:1000]!r}, "
+            f"stderr={stderr_text[:1000]!r}, "
+            f"files={directory_contents!r}"
+        )
+
+        raise LatexConversionError(
+            diagnostics
+        )
 
     # ==================================================================
     # SVG validation / sanitization
