@@ -370,6 +370,7 @@ class LatexRendererService:
 
         try:
             svg_bytes = svg_path.read_bytes()
+
         except OSError as exc:
             raise LatexConversionError(
                 "Unable to read generated SVG."
@@ -584,15 +585,36 @@ class LatexRendererService:
         command = [
             cls.PDF_TO_SVG_BINARY,
 
+            # ----------------------------------------------------------
             # SVG output.
+            # ----------------------------------------------------------
+
             "-svg",
 
+            # ----------------------------------------------------------
             # Render only the first page.
+            # ----------------------------------------------------------
+
             "-f",
             "1",
 
-            # Produce a single SVG file.
-            "-singlefile",
+            # ----------------------------------------------------------
+            # IMPORTANT:
+            #
+            # Do NOT use "-singlefile" here.
+            #
+            # pdftocairo supports "-singlefile" only with raster
+            # output formats such as PNG/JPEG/TIFF. It is invalid
+            # when "-svg" is selected.
+            #
+            # With SVG output, pdftocairo automatically creates:
+            #
+            #     document.svg
+            #
+            # from the output prefix:
+            #
+            #     document
+            # ----------------------------------------------------------
 
             str(pdf_path),
 
@@ -649,6 +671,8 @@ class LatexRendererService:
                 f"PDF to SVG conversion failed: {detail}"
             )
 
+        # pdftocairo -svg <pdf> <prefix>
+        # creates <prefix>.svg
         svg_path = Path(
             f"{svg_prefix}.svg"
         )
@@ -728,7 +752,7 @@ class LatexRendererService:
         # --------------------------------------------------------------
 
         svg = re.sub(
-            r'\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|\'[^\']*\')',
+            r'\s+on[a-zA-Z]+\s*=\s*("[^"]*"|\'[^\']*\')',
             "",
             svg,
             flags=re.IGNORECASE,
