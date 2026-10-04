@@ -1,4 +1,5 @@
 from fastapi import APIRouter
+
 from app.api.v1.endpoints import (
     attempts,
     auth,
@@ -10,32 +11,112 @@ from app.api.v1.endpoints import (
     super_admin,
     team,
     sells,
-    
+    latex,
 )
 
 from app.api.v1.team import contribution
 from app.api.v1.team.progress import router as team_progress_router
 
+
 api_router = APIRouter()
 
-# Explicit RESTful prefixes ensuring stable routes across all micro-services
-api_router.include_router(auth.router, prefix="/auth", tags=["Authentication"])
-api_router.include_router(attempts.router, prefix="/attempts", tags=["Attempts"])
-api_router.include_router(payments.router, prefix="/payments", tags=["Payments"])
-api_router.include_router(leaderboards.router, prefix="/leaderboards", tags=["Leaderboards"])
 
-api_router.include_router(analytics.router, prefix="/analytics", tags=["Analytics"])
+# ----------------------------------------------------------------------
+# Authentication
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    auth.router,
+    prefix="/auth",
+    tags=["Authentication"],
+)
 
 
-api_router.include_router(admin.router, prefix="/admin", tags=["Admin Studio & CMS"])
+# ----------------------------------------------------------------------
+# Attempts
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    attempts.router,
+    prefix="/attempts",
+    tags=["Attempts"],
+)
 
 
-api_router.include_router(sells.router)
+# ----------------------------------------------------------------------
+# Payments
+# ----------------------------------------------------------------------
 
-api_router.include_router(contribution.router)
+api_router.include_router(
+    payments.router,
+    prefix="/payments",
+    tags=["Payments"],
+)
 
-api_router.include_router(team_progress_router)
 
+# ----------------------------------------------------------------------
+# Leaderboards
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    leaderboards.router,
+    prefix="/leaderboards",
+    tags=["Leaderboards"],
+)
+
+
+# ----------------------------------------------------------------------
+# Analytics
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    analytics.router,
+    prefix="/analytics",
+    tags=["Analytics"],
+)
+
+
+# ----------------------------------------------------------------------
+# Admin
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    admin.router,
+    prefix="/admin",
+    tags=["Admin Studio & CMS"],
+)
+
+
+# ----------------------------------------------------------------------
+# Sales
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    sells.router,
+)
+
+
+# ----------------------------------------------------------------------
+# Team contribution
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    contribution.router,
+)
+
+
+# ----------------------------------------------------------------------
+# Team progress
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    team_progress_router,
+)
+
+
+# ----------------------------------------------------------------------
+# Storage / R2
+# ----------------------------------------------------------------------
 
 api_router.include_router(
     storage.router,
@@ -43,9 +124,33 @@ api_router.include_router(
     tags=["Storage"],
 )
 
-# Team router provides prefix="/admin" internally, so include without duplicate prefix
-api_router.include_router(team.router, tags=["Team & Authoring"])
 
-api_router.include_router(super_admin.router, tags=["Super Admin"])
+# ----------------------------------------------------------------------
+# Team / Question Authoring
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    team.router,
+    tags=["Team & Authoring"],
+)
 
 
+# ----------------------------------------------------------------------
+# Super Admin
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    super_admin.router,
+    tags=["Super Admin"],
+)
+
+
+# ----------------------------------------------------------------------
+# LaTeX / TikZ Rendering
+# ----------------------------------------------------------------------
+
+api_router.include_router(
+    latex.router,
+    prefix="/latex",
+    tags=["LaTeX Rendering"],
+)
