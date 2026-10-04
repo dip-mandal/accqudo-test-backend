@@ -4,18 +4,38 @@ Accqudo LaTeX Sanitizer
 
 Security layer for server-side LaTeX/TikZ rendering.
 
+The renderer accepts either:
+
+1. LaTeX body content
+
+   \\begin{tikzpicture}
+       ...
+   \\end{tikzpicture}
+
+or:
+
+2. A complete LaTeX document
+
+   \\documentclass{standalone}
+   \\usepackage{tikz}
+
+   \\begin{document}
+       ...
+   \\end{document}
+
+Complete-document wrappers are normalized into an Accqudo-controlled
+document before compilation.
+
 IMPORTANT:
-- Never compile raw user-provided LaTeX directly.
-- This sanitizer intentionally rejects commands that can access the
-  filesystem, execute shell commands, or modify the compilation environment.
-- The renderer should still run inside a restricted temporary directory
-  with a timeout and resource limits.
+- User-controlled LaTeX is never compiled directly.
+- Arbitrary packages are not allowed.
+- File access and shell execution are blocked.
+- The renderer still runs inside a restricted temporary directory.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 
 class LatexSecurityError(ValueError):
@@ -23,46 +43,27 @@ class LatexSecurityError(ValueError):
 
 
 class LatexSanitizer:
-    """
-    Validates and sanitizes LaTeX before server-side compilation.
-
-    The goal is NOT to implement a complete LaTeX parser.
-
-    Instead, this class provides a defensive first layer that:
-      1. Rejects dangerous TeX primitives.
-      2. Rejects arbitrary document/package injection.
-      3. Rejects shell/file access commands.
-      4. Validates selected TikZ libraries.
-      5. Removes harmless wrapper commands that the backend owns.
-    """
-
     # ------------------------------------------------------------------
-    # Hard limits
+    # Limits
     # ------------------------------------------------------------------
 
     MAX_INPUT_LENGTH = 50_000
 
     # ------------------------------------------------------------------
-    # Commands which must never appear in user-controlled LaTeX.
-    #
-    # These are intentionally conservative.
+    # Commands that must never be supplied by the user.
     # ------------------------------------------------------------------
 
     BLOCKED_COMMANDS = {
         # Shell / OS execution
         "write18",
-        "immediate",
-        "input",
-        "include",
         "openin",
         "openout",
         "closein",
         "closeout",
         "read",
-        "write",
         "ifeof",
 
-        # TeX expansion / primitive manipulation
+        # Dangerous TeX manipulation
         "csname",
         "endcsname",
         "expandafter",
@@ -75,67 +76,115 @@ class LatexSanitizer:
         "afterassignment",
         "aftergroup",
 
-        # Environment / document manipulation
-        "documentclass",
-        "usepackage",
-        "RequirePackage",
-        "LoadClass",
-        "PassOptionsToPackage",
+        # Dynamic loading
+        "loadclass",
+        "requirepackage",
+        "passoptionstopackage",
+        "passoptionstoclass",
 
-        # Shell escape related
-        "ShellEscape",
-        "pdfshellescape",
-
-        # File/system-related packages/macros
+        # File inclusion
+        "input",
+        "include",
         "verbatiminput",
         "lstinputlisting",
 
-        # External references
+        # Shell escape related
+        "shellescape",
+        "pdfshellescape",
+
+        # Dangerous environment manipulation
+        "catcode",
+        "endlinechar",
+        "newlinechar",
+
+        # URL/file access
         "href",
         "url",
     }
 
     # ------------------------------------------------------------------
-    # Raw textual patterns that should be blocked even if they don't
-    # map cleanly to a command name.
+    # Raw patterns
     # ------------------------------------------------------------------
 
     BLOCKED_PATTERNS = [
-        # TeX shell escape
-        re.compile(r"\\+write18\b", re.IGNORECASE),
-        re.compile(r"\\+immediate\s*\\+write18\b", re.IGNORECASE),
+        re.compile(
+            r"\\+write18\b",
+            re.IGNORECASE,
+        ),
 
-        # Shell escape flags
-        re.compile(r"--shell-escape\b", re.IGNORECASE),
-        re.compile(r"-shell-escape\b", re.IGNORECASE),
-        re.compile(r"shell_escape", re.IGNORECASE),
+        re.compile(
+            r"\\+immediate\s*\\+write18\b",
+            re.IGNORECASE,
+        ),
 
-        # Common dangerous filesystem primitives
-        re.compile(r"\\+openout\b", re.IGNORECASE),
-        re.compile(r"\\+openin\b", re.IGNORECASE),
-        re.compile(r"\\+input\b", re.IGNORECASE),
-        re.compile(r"\\+include\b", re.IGNORECASE),
-        re.compile(r"\\+verbatiminput\b", re.IGNORECASE),
+        re.compile(
+            r"--shell-escape\b",
+            re.IGNORECASE,
+        ),
 
-        # Environment-variable / OS tricks
-        re.compile(r"\\+sys_get_shell\b", re.IGNORECASE),
-        re.compile(r"\\+@@input\b", re.IGNORECASE),
+        re.compile(
+            r"-shell-escape\b",
+            re.IGNORECASE,
+        ),
 
-        # URL/file URI attempts
-        re.compile(r"file://", re.IGNORECASE),
-        re.compile(r"file:", re.IGNORECASE),
+        re.compile(
+            r"shell_escape",
+            re.IGNORECASE,
+        ),
 
-        # LaTeX escape/environment manipulation
-        re.compile(r"\\+catcode\b", re.IGNORECASE),
-        re.compile(r"\\+endlinechar\b", re.IGNORECASE),
-        re.compile(r"\\+newlinechar\b", re.IGNORECASE),
+        re.compile(
+            r"\\+openout\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+openin\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+input\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+include\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+verbatiminput\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+catcode\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+sys_get_shell\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"\\+@@input\b",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"file://",
+            re.IGNORECASE,
+        ),
+
+        re.compile(
+            r"file:",
+            re.IGNORECASE,
+        ),
     ]
 
     # ------------------------------------------------------------------
-    # TikZ libraries we are willing to enable.
-    #
-    # This list can be expanded later when Accqudo needs more TikZ
-    # functionality.
+    # Allowed TikZ libraries.
     # ------------------------------------------------------------------
 
     ALLOWED_TIKZ_LIBRARIES = {
@@ -162,27 +211,22 @@ class LatexSanitizer:
     }
 
     # ------------------------------------------------------------------
-    # Commands which are allowed but whose dangerous variants should be
-    # handled carefully.
+    # Packages that may be explicitly requested by the author.
+    #
+    # Accqudo still controls the actual document preamble.
     # ------------------------------------------------------------------
 
-    ALLOWED_EXTERNAL_COMMANDS = {
+    ALLOWED_PACKAGES = {
+        "amsmath",
+        "amssymb",
+        "amsfonts",
+        "mathtools",
+        "xcolor",
+        "graphicx",
         "tikz",
-        "draw",
-        "path",
-        "node",
-        "coordinate",
-        "fill",
-        "filldraw",
-        "clip",
-        "shade",
-        "shadedraw",
-        "pattern",
-        "matrix",
-        "foreach",
-        "filldraw",
-        "graph",
-        "usetikzlibrary",
+        "standalone",
+        "inputenc",
+        "fontenc",
     }
 
     # ------------------------------------------------------------------
@@ -192,24 +236,27 @@ class LatexSanitizer:
     @classmethod
     def sanitize(cls, latex: str) -> str:
         """
-        Validate and sanitize user LaTeX.
+        Validate and normalize LaTeX.
 
-        Returns:
-            Sanitized LaTeX string.
+        Returns only the body that Accqudo should compile.
 
-        Raises:
-            LatexSecurityError:
-                If the input contains a dangerous construct.
+        Complete document wrappers are removed.
         """
 
         if latex is None:
-            raise LatexSecurityError("LaTeX content cannot be null.")
+            raise LatexSecurityError(
+                "LaTeX content cannot be null."
+            )
 
         if not isinstance(latex, str):
-            raise LatexSecurityError("LaTeX content must be a string.")
+            raise LatexSecurityError(
+                "LaTeX content must be a string."
+            )
 
         if not latex.strip():
-            raise LatexSecurityError("LaTeX content cannot be empty.")
+            raise LatexSecurityError(
+                "LaTeX content cannot be empty."
+            )
 
         if len(latex) > cls.MAX_INPUT_LENGTH:
             raise LatexSecurityError(
@@ -217,32 +264,64 @@ class LatexSanitizer:
                 f"of {cls.MAX_INPUT_LENGTH} characters."
             )
 
-        # Normalize line endings.
-        content = latex.replace("\r\n", "\n").replace("\r", "\n")
+        content = latex.replace(
+            "\r\n",
+            "\n",
+        ).replace(
+            "\r",
+            "\n",
+        )
+
+        content = content.lstrip("\ufeff")
+
+        # --------------------------------------------------------------
+        # Security checks BEFORE normalization.
+        # --------------------------------------------------------------
 
         cls._check_blocked_patterns(content)
         cls._check_blocked_commands(content)
+
+        # --------------------------------------------------------------
+        # Validate explicit package requests.
+        # --------------------------------------------------------------
+
+        cls._validate_packages(content)
+
+        # --------------------------------------------------------------
+        # Validate TikZ libraries.
+        # --------------------------------------------------------------
+
         cls._validate_tikz_libraries(content)
-        cls._check_document_wrappers(content)
+
+        # --------------------------------------------------------------
+        # Normalize complete LaTeX document into its body.
+        # --------------------------------------------------------------
+
+        content = cls._extract_document_body(content)
+
+        # --------------------------------------------------------------
+        # Validate the final body.
+        # --------------------------------------------------------------
+
+        if not content.strip():
+            raise LatexSecurityError(
+                "LaTeX document does not contain any renderable content."
+            )
+
         cls._check_balanced_basic_delimiters(content)
-
-        # Remove BOM if supplied.
-        content = content.lstrip("\ufeff")
-
-        # Remove accidental document wrappers.
-        #
-        # We don't allow users to control the document class or package
-        # loading. The backend renderer owns the complete LaTeX document.
-        content = cls._remove_document_wrappers(content)
 
         return content.strip()
 
     # ------------------------------------------------------------------
-    # Validation
+    # Blocked constructs
     # ------------------------------------------------------------------
 
     @classmethod
-    def _check_blocked_patterns(cls, content: str) -> None:
+    def _check_blocked_patterns(
+        cls,
+        content: str,
+    ) -> None:
+
         for pattern in cls.BLOCKED_PATTERNS:
             if pattern.search(content):
                 raise LatexSecurityError(
@@ -250,14 +329,10 @@ class LatexSanitizer:
                 )
 
     @classmethod
-    def _check_blocked_commands(cls, content: str) -> None:
-        """
-        Detect LaTeX command names.
-
-        Example:
-            \\input{secret.tex}
-            -> command = input
-        """
+    def _check_blocked_commands(
+        cls,
+        content: str,
+    ) -> None:
 
         commands = re.findall(
             r"\\+([A-Za-z@]+)",
@@ -276,20 +351,46 @@ class LatexSanitizer:
                     f"LaTeX command '\\{command}' is not allowed."
                 )
 
+    # ------------------------------------------------------------------
+    # Package validation
+    # ------------------------------------------------------------------
+
     @classmethod
-    def _validate_tikz_libraries(cls, content: str) -> None:
-        """
-        Validate \\usetikzlibrary{...}.
+    def _validate_packages(
+        cls,
+        content: str,
+    ) -> None:
 
-        Example:
+        package_pattern = re.compile(
+            r"\\+usepackage"
+            r"(?:\s*\[[^\]]*\])?"
+            r"\s*\{([^}]*)\}",
+            flags=re.IGNORECASE,
+        )
 
-            \\usetikzlibrary{positioning,arrows.meta}
+        for match in package_pattern.finditer(content):
+            package_list = match.group(1)
 
-        is allowed.
+            for package in package_list.split(","):
+                package = package.strip()
 
-        Unknown libraries are rejected so the user cannot arbitrarily
-        request additional TeX functionality.
-        """
+                if not package:
+                    continue
+
+                if package not in cls.ALLOWED_PACKAGES:
+                    raise LatexSecurityError(
+                        f"LaTeX package '{package}' is not allowed."
+                    )
+
+    # ------------------------------------------------------------------
+    # TikZ library validation
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _validate_tikz_libraries(
+        cls,
+        content: str,
+    ) -> None:
 
         pattern = re.compile(
             r"\\+usetikzlibrary\s*\{([^}]*)\}",
@@ -310,38 +411,135 @@ class LatexSanitizer:
                         f"TikZ library '{library}' is not allowed."
                     )
 
+    # ------------------------------------------------------------------
+    # Complete document handling
+    # ------------------------------------------------------------------
+
     @classmethod
-    def _check_document_wrappers(cls, content: str) -> None:
+    def _extract_document_body(
+        cls,
+        content: str,
+    ) -> str:
         """
-        Reject explicit document/package configuration.
+        Convert either a complete LaTeX document or a LaTeX body into
+        body-only content.
 
-        The backend will generate the complete document wrapper.
+        Example:
+
+            \\documentclass{standalone}
+
+            \\usepackage{tikz}
+
+            \\begin{document}
+
+            HELLO
+
+            \\end{document}
+
+        becomes:
+
+            HELLO
         """
 
-        forbidden_wrappers = [
-            r"\\+documentclass\b",
-            r"\\+usepackage\b",
+        # --------------------------------------------------------------
+        # Remove documentclass.
+        #
+        # We do not trust or use the user's document class.
+        # --------------------------------------------------------------
+
+        content = re.sub(
+            r"\\+documentclass"
+            r"(?:\s*\[[^\]]*\])?"
+            r"\s*\{[^}]*\}",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        )
+
+        # --------------------------------------------------------------
+        # Remove allowed usepackage declarations.
+        #
+        # Accqudo controls the actual preamble in the renderer.
+        # --------------------------------------------------------------
+
+        content = re.sub(
+            r"\\+usepackage"
+            r"(?:\s*\[[^\]]*\])?"
+            r"\s*\{[^}]*\}",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        )
+
+        # --------------------------------------------------------------
+        # Remove TikZ library declarations.
+        #
+        # The renderer owns the required TikZ libraries.
+        # --------------------------------------------------------------
+
+        content = re.sub(
+            r"\\+usetikzlibrary\s*\{[^}]*\}",
+            "",
+            content,
+            flags=re.IGNORECASE,
+        )
+
+        # --------------------------------------------------------------
+        # If a document environment exists, extract its contents.
+        # --------------------------------------------------------------
+
+        begin_match = re.search(
             r"\\+begin\s*\{\s*document\s*\}",
-            r"\\+end\s*\{\s*document\s*\}",
-        ]
+            content,
+            flags=re.IGNORECASE,
+        )
 
-        for pattern in forbidden_wrappers:
-            if re.search(pattern, content, flags=re.IGNORECASE):
+        end_matches = list(
+            re.finditer(
+                r"\\+end\s*\{\s*document\s*\}",
+                content,
+                flags=re.IGNORECASE,
+            )
+        )
+
+        if begin_match:
+            if not end_matches:
                 raise LatexSecurityError(
-                    "Document/package wrappers are not allowed. "
-                    "Provide only the LaTeX/TikZ content."
+                    "LaTeX contains \\begin{document} "
+                    "but no matching \\end{document}."
                 )
 
+            end_match = end_matches[-1]
+
+            if end_match.start() < begin_match.end():
+                raise LatexSecurityError(
+                    "Invalid LaTeX document wrapper."
+                )
+
+            content = content[
+                begin_match.end():end_match.start()
+            ]
+
+        else:
+            # If there is no begin{document}, there must not be an
+            # end{document} floating around.
+            if end_matches:
+                raise LatexSecurityError(
+                    "LaTeX contains \\end{document} "
+                    "without \\begin{document}."
+                )
+
+        return content.strip()
+
+    # ------------------------------------------------------------------
+    # Basic delimiter validation
+    # ------------------------------------------------------------------
+
     @classmethod
-    def _check_balanced_basic_delimiters(cls, content: str) -> None:
-        """
-        Basic delimiter validation.
-
-        This is deliberately not a full TeX parser.
-
-        We check the most common delimiters so obviously malformed
-        content can be rejected before compilation.
-        """
+    def _check_balanced_basic_delimiters(
+        cls,
+        content: str,
+    ) -> None:
 
         pairs = [
             ("{", "}"),
@@ -350,9 +548,14 @@ class LatexSanitizer:
         ]
 
         for opening, closing in pairs:
-            if not cls._is_balanced(content, opening, closing):
+            if not cls._is_balanced(
+                content,
+                opening,
+                closing,
+            ):
                 raise LatexSecurityError(
-                    f"Unbalanced LaTeX delimiter: '{opening}' / '{closing}'."
+                    f"Unbalanced LaTeX delimiter: "
+                    f"'{opening}' / '{closing}'."
                 )
 
     @staticmethod
@@ -361,17 +564,12 @@ class LatexSanitizer:
         opening: str,
         closing: str,
     ) -> bool:
-        """
-        Check delimiter balance while ignoring escaped delimiters.
-
-        This is intentionally simple and should not be considered a
-        complete TeX parser.
-        """
 
         depth = 0
         escaped = False
 
         for char in content:
+
             if escaped:
                 escaped = False
                 continue
@@ -392,33 +590,14 @@ class LatexSanitizer:
         return depth == 0
 
     # ------------------------------------------------------------------
-    # Sanitization helpers
+    # Detection helpers
     # ------------------------------------------------------------------
 
     @classmethod
-    def _remove_document_wrappers(cls, content: str) -> str:
-        """
-        Remove harmless accidental wrappers.
-
-        This method is intentionally conservative.
-
-        Since _check_document_wrappers() already rejects explicit
-        document/package wrappers, this mainly removes leading/trailing
-        whitespace and UTF-8 BOMs.
-        """
-
-        content = content.lstrip("\ufeff")
-        return content.strip()
-
-    # ------------------------------------------------------------------
-    # Utility helpers
-    # ------------------------------------------------------------------
-
-    @classmethod
-    def contains_tikz(cls, latex: str) -> bool:
-        """
-        Return True when content appears to require TikZ rendering.
-        """
+    def contains_tikz(
+        cls,
+        latex: str,
+    ) -> bool:
 
         if not latex:
             return False
@@ -432,21 +611,27 @@ class LatexSanitizer:
             r"\\+node\b",
             r"\\+coordinate\b",
             r"\\+filldraw\b",
+            r"\\+fill\b",
+            r"\\+clip\b",
+            r"\\+shade\b",
+            r"\\+shadedraw\b",
+            r"\\+foreach\b",
         ]
 
         return any(
-            re.search(pattern, latex, flags=re.IGNORECASE)
+            re.search(
+                pattern,
+                latex,
+                flags=re.IGNORECASE,
+            )
             for pattern in tikz_patterns
         )
 
     @classmethod
-    def contains_complex_latex(cls, latex: str) -> bool:
-        """
-        Detect LaTeX that is more appropriate for server-side rendering
-        than ordinary browser KaTeX rendering.
-
-        This is intentionally broader than contains_tikz().
-        """
+    def contains_complex_latex(
+        cls,
+        latex: str,
+    ) -> bool:
 
         if not latex:
             return False
@@ -463,20 +648,20 @@ class LatexSanitizer:
         ]
 
         return any(
-            re.search(pattern, latex, flags=re.IGNORECASE)
+            re.search(
+                pattern,
+                latex,
+                flags=re.IGNORECASE,
+            )
             for pattern in complex_patterns
         )
 
 
-def sanitize_latex(latex: str) -> str:
+def sanitize_latex(
+    latex: str,
+) -> str:
     """
     Convenience function.
-
-    Example:
-
-        from app.services.latex_sanitizer import sanitize_latex
-
-        safe_latex = sanitize_latex(user_input)
     """
 
     return LatexSanitizer.sanitize(latex)

@@ -17,6 +17,7 @@ The endpoint only returns a generated SVG preview.
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -34,14 +35,17 @@ from app.services.latex_renderer_service import (
 from app.services.latex_sanitizer import LatexSecurityError
 
 
+logger = logging.getLogger("accqudo_latex")
+
+
 router = APIRouter(
     tags=["LaTeX Rendering"],
 )
 
 
-# ----------------------------------------------------------------------
+# ======================================================================
 # Request / Response Schemas
-# ----------------------------------------------------------------------
+# ======================================================================
 
 
 class LatexRenderRequest(BaseModel):
@@ -73,9 +77,9 @@ class LatexRenderResponse(BaseModel):
     contains_tikz: bool = False
 
 
-# ----------------------------------------------------------------------
+# ======================================================================
 # Render Endpoint
-# ----------------------------------------------------------------------
+# ======================================================================
 
 
 @router.post(
@@ -90,21 +94,17 @@ async def render_latex(
     """
     Render LaTeX/TikZ into SVG.
 
-    This endpoint is intentionally authenticated because server-side
-    LaTeX compilation is a computationally expensive operation.
+    This endpoint is authenticated because server-side LaTeX
+    compilation is computationally expensive.
 
-    The authenticated user does not need to have an admin role here.
-    The frontend can therefore use the same renderer for authenticated
-    authoring workflows.
+    The original LaTeX is not persisted.
 
-    If you later want to restrict rendering to ADMIN/SUPER_ADMIN users,
-    the authorization check can be tightened without changing the
-    rendering service.
+    The endpoint returns only the generated SVG preview.
     """
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Basic validation
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     latex = payload.latex.strip()
 
@@ -114,30 +114,43 @@ async def render_latex(
             detail="LaTeX content cannot be empty.",
         )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Render
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     try:
         result = await LatexRendererService.render(
             latex=latex,
         )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Security rejection
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     except LatexSecurityError as exc:
+        logger.warning(
+            "Blocked unsafe LaTeX render request. "
+            "user_id=%s reason=%s",
+            getattr(current_user, "id", "unknown"),
+            str(exc),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Compilation timeout
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     except LatexRenderTimeout as exc:
+        logger.warning(
+            "LaTeX render timeout. "
+            "user_id=%s",
+            getattr(current_user, "id", "unknown"),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_408_REQUEST_TIMEOUT,
             detail=(
@@ -146,56 +159,87 @@ async def render_latex(
             ),
         ) from exc
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # LaTeX compilation failure
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     except LatexCompilationError as exc:
+        logger.warning(
+            "LaTeX compilation failed. "
+            "user_id=%s error=%s",
+            getattr(current_user, "id", "unknown"),
+            str(exc),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
+            detail=(
+                "LaTeX compilation failed. "
+                "Please check the LaTeX syntax."
+            ),
         ) from exc
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # PDF -> SVG failure
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     except LatexConversionError as exc:
+        logger.error(
+            "LaTeX PDF-to-SVG conversion failed. "
+            "user_id=%s error=%s",
+            getattr(current_user, "id", "unknown"),
+            str(exc),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
+            detail=(
+                "The LaTeX document was compiled, "
+                "but SVG conversion failed."
+            ),
         ) from exc
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Generic renderer error
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     except LatexRenderError as exc:
+        logger.error(
+            "LaTeX renderer error. "
+            "user_id=%s error=%s",
+            getattr(current_user, "id", "unknown"),
+            str(exc),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(exc),
+            detail=(
+                "Unable to render the LaTeX content."
+            ),
         ) from exc
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Unexpected server error
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    except Exception as exc:
-        # Do not expose internal exception details to the browser.
-        #
-        # Your application logging middleware/logger can capture the
-        # actual traceback separately.
+    except Exception:
+        logger.exception(
+            "Unexpected LaTeX rendering error. "
+            "user_id=%s",
+            getattr(current_user, "id", "unknown"),
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=(
                 "An unexpected error occurred while rendering "
                 "the LaTeX content."
             ),
-        ) from exc
+        )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Return SVG
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
 
     return LatexRenderResponse(
         success=True,

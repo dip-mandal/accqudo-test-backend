@@ -4,36 +4,42 @@ Accqudo LaTeX / TikZ Renderer Service
 
 Server-side renderer for complex LaTeX and TikZ content.
 
-Architecture:
+Supported input:
 
-    User LaTeX
-        |
-        v
-    LatexSanitizer
-        |
-        v
-    Controlled LaTeX document
-        |
-        v
-    pdflatex
-        |
-        v
-    PDF
-        |
-        v
-    pdftocairo
-        |
-        v
-    SVG
-        |
-        v
-    API response
+1. LaTeX body content
+
+    \\[
+        x^2 + y^2 = z^2
+    \\]
+
+2. TikZ body content
+
+    \\begin{tikzpicture}
+        \\draw (0,0) -- (2,2);
+    \\end{tikzpicture}
+
+3. Complete LaTeX documents
+
+    \\documentclass{standalone}
+    \\usepackage{tikz}
+
+    \\begin{document}
+
+    \\begin{tikzpicture}
+        ...
+    \\end{tikzpicture}
+
+    \\end{document}
+
+The LatexSanitizer is responsible for validating and normalizing the
+input. This service then creates an Accqudo-controlled LaTeX document,
+compiles it to PDF, and converts the first page to SVG.
 
 IMPORTANT SECURITY NOTES
 ------------------------
-This service assumes the underlying container is also hardened.
 
 The application layer:
+
     - never uses shell=True
     - uses a temporary isolated directory
     - uses a strict timeout
@@ -41,12 +47,14 @@ The application layer:
     - sanitizes LaTeX before compilation
     - limits input/output size
     - cleans up temporary files
+    - sanitizes generated SVG
 
 The Docker/container layer should additionally:
-    - run as a non-root user
-    - ideally use a read-only filesystem
+
+    - run as a non-root user where practical
     - limit CPU/memory
-    - restrict network access where possible
+    - restrict network access where practical
+    - use an isolated runtime
 """
 
 from __future__ import annotations
@@ -66,6 +74,11 @@ from app.services.latex_sanitizer import (
 )
 
 
+# ======================================================================
+# Exceptions
+# ======================================================================
+
+
 class LatexRenderError(RuntimeError):
     """Base exception for LaTeX rendering failures."""
 
@@ -80,6 +93,11 @@ class LatexConversionError(LatexRenderError):
 
 class LatexRenderTimeout(LatexRenderError):
     """Raised when LaTeX rendering exceeds the allowed timeout."""
+
+
+# ======================================================================
+# Result
+# ======================================================================
 
 
 @dataclass
@@ -98,13 +116,17 @@ class LatexRenderResult:
 
     contains_tikz:
         Whether the input was detected as TikZ.
-
     """
 
     svg: str
     width: Optional[str] = None
     height: Optional[str] = None
     contains_tikz: bool = False
+
+
+# ======================================================================
+# Renderer Service
+# ======================================================================
 
 
 class LatexRendererService:
@@ -115,7 +137,7 @@ class LatexRendererService:
     """
 
     # ------------------------------------------------------------------
-    # Configuration
+    # Executables
     # ------------------------------------------------------------------
 
     LATEX_BINARY = os.getenv(
@@ -128,7 +150,10 @@ class LatexRendererService:
         "pdftocairo",
     )
 
-    # Maximum time allowed for the complete render.
+    # ------------------------------------------------------------------
+    # Limits
+    # ------------------------------------------------------------------
+
     RENDER_TIMEOUT_SECONDS = int(
         os.getenv(
             "ACQ_LATEX_RENDER_TIMEOUT",
@@ -136,7 +161,6 @@ class LatexRendererService:
         )
     )
 
-    # Maximum input size.
     MAX_LATEX_LENGTH = int(
         os.getenv(
             "ACQ_LATEX_MAX_LENGTH",
@@ -144,7 +168,6 @@ class LatexRendererService:
         )
     )
 
-    # Maximum SVG response size.
     MAX_SVG_SIZE = int(
         os.getenv(
             "ACQ_LATEX_MAX_SVG_SIZE",
@@ -152,7 +175,6 @@ class LatexRendererService:
         )
     )
 
-    # Maximum generated PDF size.
     MAX_PDF_SIZE = int(
         os.getenv(
             "ACQ_LATEX_MAX_PDF_SIZE",
@@ -160,12 +182,26 @@ class LatexRendererService:
         )
     )
 
-    # Maximum stdout/stderr captured from TeX tools.
     MAX_PROCESS_OUTPUT = int(
         os.getenv(
             "ACQ_LATEX_MAX_PROCESS_OUTPUT",
             "100000",
         )
+    )
+
+    # ------------------------------------------------------------------
+    # Rendering configuration
+    # ------------------------------------------------------------------
+
+    BASE_LATEX_PACKAGES = (
+        r"\usepackage[utf8]{inputenc}",
+        r"\usepackage[T1]{fontenc}",
+        r"\usepackage{amsmath}",
+        r"\usepackage{amssymb}",
+        r"\usepackage{amsfonts}",
+        r"\usepackage{mathtools}",
+        r"\usepackage{xcolor}",
+        r"\usepackage{graphicx}",
     )
 
     # ------------------------------------------------------------------
@@ -180,9 +216,13 @@ class LatexRendererService:
         """
         Render user-provided LaTeX/TikZ to SVG.
 
+        The input can be either a LaTeX body or a complete LaTeX
+        document. LatexSanitizer normalizes complete documents into
+        body content before compilation.
+
         Args:
             latex:
-                LaTeX/TikZ source without a document wrapper.
+                LaTeX/TikZ source.
 
         Returns:
             LatexRenderResult
@@ -210,22 +250,28 @@ class LatexRendererService:
             )
 
         # --------------------------------------------------------------
-        # Step 1: Sanitize
+        # Security / normalization
         # --------------------------------------------------------------
 
         try:
-            safe_latex = LatexSanitizer.sanitize(latex)
+            safe_latex = LatexSanitizer.sanitize(
+                latex
+            )
         except LatexSecurityError:
-            # Re-raise security exceptions unchanged so the API layer
-            # can return a clean 400 response.
+            # Preserve the security exception so the API layer can
+            # return HTTP 400.
             raise
+
+        # --------------------------------------------------------------
+        # Detect TikZ AFTER sanitization.
+        # --------------------------------------------------------------
 
         contains_tikz = LatexSanitizer.contains_tikz(
             safe_latex
         )
 
         # --------------------------------------------------------------
-        # Step 2: Temporary isolated directory
+        # Temporary isolated working directory.
         # --------------------------------------------------------------
 
         temp_dir = tempfile.mkdtemp(
@@ -240,18 +286,15 @@ class LatexRendererService:
             )
 
         finally:
-            # ----------------------------------------------------------
-            # Always clean up.
-            # ----------------------------------------------------------
-
+            # Always clean up all generated files.
             shutil.rmtree(
                 temp_dir,
                 ignore_errors=True,
             )
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # Internal rendering pipeline
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     @classmethod
     async def _render_in_directory(
@@ -268,7 +311,7 @@ class LatexRendererService:
         svg_prefix = work_dir / "document"
 
         # --------------------------------------------------------------
-        # Generate controlled document.
+        # Build controlled TeX document.
         # --------------------------------------------------------------
 
         document = cls._build_tex_document(
@@ -282,7 +325,7 @@ class LatexRendererService:
         )
 
         # --------------------------------------------------------------
-        # Compile LaTeX -> PDF
+        # Compile LaTeX -> PDF.
         # --------------------------------------------------------------
 
         await cls._run_pdflatex(
@@ -291,7 +334,7 @@ class LatexRendererService:
         )
 
         # --------------------------------------------------------------
-        # Validate PDF
+        # Validate generated PDF.
         # --------------------------------------------------------------
 
         if not pdf_path.exists():
@@ -312,7 +355,7 @@ class LatexRendererService:
             )
 
         # --------------------------------------------------------------
-        # PDF -> SVG
+        # PDF -> SVG.
         # --------------------------------------------------------------
 
         svg_path = await cls._convert_pdf_to_svg(
@@ -322,10 +365,15 @@ class LatexRendererService:
         )
 
         # --------------------------------------------------------------
-        # Read SVG
+        # Read SVG.
         # --------------------------------------------------------------
 
-        svg_bytes = svg_path.read_bytes()
+        try:
+            svg_bytes = svg_path.read_bytes()
+        except OSError as exc:
+            raise LatexConversionError(
+                "Unable to read generated SVG."
+            ) from exc
 
         if not svg_bytes:
             raise LatexConversionError(
@@ -343,12 +391,14 @@ class LatexRendererService:
         )
 
         # --------------------------------------------------------------
-        # Basic SVG validation / sanitization
+        # Sanitize generated SVG.
         # --------------------------------------------------------------
 
         svg = cls._sanitize_svg(svg)
 
-        width, height = cls._extract_svg_dimensions(svg)
+        width, height = cls._extract_svg_dimensions(
+            svg
+        )
 
         return LatexRenderResult(
             svg=svg,
@@ -357,9 +407,9 @@ class LatexRendererService:
             contains_tikz=contains_tikz,
         )
 
-    # ------------------------------------------------------------------
-    # Controlled LaTeX document
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Controlled TeX document
+    # ==================================================================
 
     @classmethod
     def _build_tex_document(
@@ -370,44 +420,44 @@ class LatexRendererService:
         """
         Build the complete TeX document controlled by Accqudo.
 
-        Users only provide the body.
+        User content is inserted only into the document body.
 
-        They cannot control:
+        The user cannot control:
+
             - documentclass
-            - package loading
+            - arbitrary package loading
             - shell escape
-            - output configuration
+            - output directory
+            - compiler flags
         """
 
-        packages = [
-            r"\usepackage[utf8]{inputenc}",
-            r"\usepackage[T1]{fontenc}",
-            r"\usepackage{amsmath}",
-            r"\usepackage{amssymb}",
-            r"\usepackage{amsfonts}",
-            r"\usepackage{mathtools}",
-            r"\usepackage{xcolor}",
-            r"\usepackage{graphicx}",
-        ]
+        packages = list(
+            cls.BASE_LATEX_PACKAGES
+        )
 
         if contains_tikz:
-            packages.extend(
-                [
-                    r"\usepackage{tikz}",
-                    r"\usetikzlibrary{calc}",
-                    r"\usetikzlibrary{positioning}",
-                    r"\usetikzlibrary{arrows.meta}",
-                    r"\usetikzlibrary{shapes.geometric}",
-                    r"\usetikzlibrary{decorations.pathreplacing}",
-                    r"\usetikzlibrary{angles}",
-                    r"\usetikzlibrary{quotes}",
-                ]
+            packages.append(
+                r"\usepackage{tikz}"
             )
 
-        package_block = "\n".join(packages)
+            # ----------------------------------------------------------
+            # Load every TikZ library explicitly allowed by the
+            # sanitizer.
+            #
+            # This keeps sanitizer and renderer behavior consistent.
+            # ----------------------------------------------------------
 
-        # We use standalone because we only need the rendered content,
-        # not a full page.
+            for library in sorted(
+                LatexSanitizer.ALLOWED_TIKZ_LIBRARIES
+            ):
+                packages.append(
+                    rf"\usetikzlibrary{{{library}}}"
+                )
+
+        package_block = "\n".join(
+            packages
+        )
+
         document = f"""
 \\documentclass[border=4pt]{{standalone}}
 
@@ -424,9 +474,9 @@ class LatexRendererService:
 
         return document.strip() + "\n"
 
-    # ------------------------------------------------------------------
-    # pdflatex
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # PDFLaTeX
+    # ==================================================================
 
     @classmethod
     async def _run_pdflatex(
@@ -438,17 +488,34 @@ class LatexRendererService:
         command = [
             cls.LATEX_BINARY,
 
-            # Do not allow shell command execution.
+            # ----------------------------------------------------------
+            # NEVER allow TeX to execute shell commands.
+            # ----------------------------------------------------------
+
             "-no-shell-escape",
 
-            # Stop instead of waiting for interactive input.
+            # ----------------------------------------------------------
+            # Never wait for interactive input.
+            # ----------------------------------------------------------
+
             "-interaction=nonstopmode",
+
+            # ----------------------------------------------------------
+            # Stop immediately on fatal compilation errors.
+            # ----------------------------------------------------------
 
             "-halt-on-error",
 
-            # Keep all output inside the temporary directory.
+            # ----------------------------------------------------------
+            # Keep generated files inside the temporary directory.
+            # ----------------------------------------------------------
+
             "-output-directory",
             str(work_dir),
+
+            # ----------------------------------------------------------
+            # Source document.
+            # ----------------------------------------------------------
 
             str(tex_path),
         ]
@@ -498,11 +565,13 @@ class LatexRendererService:
                 stderr_text=stderr_text,
             )
 
-            raise LatexCompilationError(message)
+            raise LatexCompilationError(
+                message
+            )
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # PDF -> SVG
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     @classmethod
     async def _convert_pdf_to_svg(
@@ -518,10 +587,11 @@ class LatexRendererService:
             # SVG output.
             "-svg",
 
-            # Single page only.
+            # Render only the first page.
             "-f",
             "1",
 
+            # Produce a single SVG file.
             "-singlefile",
 
             str(pdf_path),
@@ -590,9 +660,9 @@ class LatexRendererService:
 
         return svg_path
 
-    # ------------------------------------------------------------------
-    # SVG validation
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # SVG validation / sanitization
+    # ==================================================================
 
     @classmethod
     def _sanitize_svg(
@@ -602,19 +672,24 @@ class LatexRendererService:
         """
         Apply defensive SVG cleanup.
 
-        pdftocairo normally generates SVG that does not contain
-        executable JavaScript, but the response should still be treated
-        as untrusted output.
+        pdftocairo normally produces SVG without executable
+        JavaScript, but generated SVG is still treated as untrusted
+        output before being inserted into the frontend.
 
-        We therefore remove:
+        Removes:
+
             - XML declarations
             - DOCTYPE declarations
             - script elements
-            - event-handler attributes
+            - inline event handlers
             - javascript: URLs
+            - XML entities
         """
 
-        # Remove XML declaration.
+        # --------------------------------------------------------------
+        # XML declaration
+        # --------------------------------------------------------------
+
         svg = re.sub(
             r"<\?xml[^>]*\?>",
             "",
@@ -622,7 +697,10 @@ class LatexRendererService:
             flags=re.IGNORECASE,
         )
 
-        # Remove DOCTYPE.
+        # --------------------------------------------------------------
+        # DOCTYPE
+        # --------------------------------------------------------------
+
         svg = re.sub(
             r"<!DOCTYPE[^>]*>",
             "",
@@ -630,7 +708,10 @@ class LatexRendererService:
             flags=re.IGNORECASE,
         )
 
-        # Remove script blocks.
+        # --------------------------------------------------------------
+        # Script elements
+        # --------------------------------------------------------------
+
         svg = re.sub(
             r"<script\b[^>]*>.*?</script>",
             "",
@@ -638,20 +719,25 @@ class LatexRendererService:
             flags=re.IGNORECASE | re.DOTALL,
         )
 
-        # Remove inline event handlers:
+        # --------------------------------------------------------------
+        # Inline event handlers:
         #
         # onclick=""
         # onload=""
         # onmouseover=""
-        #
+        # --------------------------------------------------------------
+
         svg = re.sub(
-            r"\s+on[a-zA-Z]+\s*=\s*(?:\"[^\"]*\"|'[^']*')",
+            r'\s+on[a-zA-Z]+\s*=\s*(?:"[^"]*"|\'[^\']*\')',
             "",
             svg,
             flags=re.IGNORECASE,
         )
 
-        # Remove javascript: URLs.
+        # --------------------------------------------------------------
+        # javascript: URLs
+        # --------------------------------------------------------------
+
         svg = re.sub(
             r"javascript\s*:",
             "",
@@ -659,7 +745,10 @@ class LatexRendererService:
             flags=re.IGNORECASE,
         )
 
-        # Remove external HTML/XML entities.
+        # --------------------------------------------------------------
+        # External XML entities
+        # --------------------------------------------------------------
+
         svg = re.sub(
             r"<!ENTITY[^>]*>",
             "",
@@ -674,7 +763,10 @@ class LatexRendererService:
                 "SVG became empty after sanitization."
             )
 
-        # Must contain an SVG root.
+        # --------------------------------------------------------------
+        # SVG root validation
+        # --------------------------------------------------------------
+
         if not re.search(
             r"<svg\b",
             svg,
@@ -686,9 +778,9 @@ class LatexRendererService:
 
         return svg
 
-    # ------------------------------------------------------------------
+    # ==================================================================
     # SVG metadata
-    # ------------------------------------------------------------------
+    # ==================================================================
 
     @staticmethod
     def _extract_svg_dimensions(
@@ -732,9 +824,9 @@ class LatexRendererService:
 
         return width, height
 
-    # ------------------------------------------------------------------
-    # Error handling helpers
-    # ------------------------------------------------------------------
+    # ==================================================================
+    # Compilation error handling
+    # ==================================================================
 
     @classmethod
     def _extract_compilation_error(
@@ -754,12 +846,15 @@ class LatexRendererService:
                 "LaTeX compilation failed without diagnostic output."
             )
 
-        # Try to extract the most useful TeX error line.
         lines = [
             line.strip()
             for line in combined.splitlines()
             if line.strip()
         ]
+
+        # --------------------------------------------------------------
+        # Standard TeX error lines begin with !
+        # --------------------------------------------------------------
 
         error_lines = [
             line
@@ -773,13 +868,20 @@ class LatexRendererService:
                 + error_lines[0][:2000]
             )
 
-        # Fall back to last useful diagnostic lines.
+        # --------------------------------------------------------------
+        # Fall back to the final diagnostic lines.
+        # --------------------------------------------------------------
+
         tail = lines[-10:]
 
         return (
             "LaTeX compilation failed:\n"
             + "\n".join(tail)[:4000]
         )
+
+    # ==================================================================
+    # Process output limits
+    # ==================================================================
 
     @classmethod
     def _limit_process_output(
